@@ -37,10 +37,10 @@ function tick() {
   if (day === 0 || day === 6) return;          // weekends off
   const hm = ist.getHours() * 60 + ist.getMinutes();
 
-  // RULE #1 cross alerts: every 3 minutes, 9:19 - 15:15 IST.
-  // (Set the Apps Script trigger to EVERY MINUTE for true 3-min cadence.)
-  if (hm >= 9 * 60 + 19 && hm <= 15 * 60 + 15 && ist.getMinutes() % 3 === 0)
-    dispatch('rule1.yml');
+  // RULE #1 cross alerts — every tick inside the window.
+  // (Cadence = your trigger interval. Duplicates are absorbed workflow-side:
+  //  each stock alerts only once per day via rule1_state.json.)
+  if (hm >= 9 * 60 + 19 && hm <= 15 * 60 + 15) dispatch('rule1.yml');
 
   // Evening deals digest: one dispatch window 18:42-18:50 IST
   if (hm >= 18 * 60 + 42 && hm <= 18 * 60 + 50) dispatch('deals.yml');
@@ -48,9 +48,9 @@ function tick() {
   // Paper trader: manage entries/exits every tick 9:28-11:05 IST
   if (hm >= 9 * 60 + 28 && hm <= 11 * 60 + 5) dispatch('paper.yml');
 
-  // Sheet data logger: every 5 min, 9:15-15:35 IST
-  if (hm >= 9 * 60 + 15 && hm <= 15 * 60 + 35 && ist.getMinutes() % 5 === 0)
-    dispatch('sheetlog.yml');
+  // Sheet data logger — every tick inside the window (one snapshot column
+  // per run; re-running the same minute just overwrites that column).
+  if (hm >= 9 * 60 + 15 && hm <= 15 * 60 + 35) dispatch('sheetlog.yml');
 
   // /scan checker: market hours
   if (hm >= 8 * 60 + 30 && hm <= 16 * 60 + 30) dispatch('ondemand.yml');
