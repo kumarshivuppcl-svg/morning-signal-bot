@@ -21,9 +21,21 @@ const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 const FIXED = 5;                       // Symbol, Metric, Deliv, PrevDay, PrevLastHr
 
 
-function refreshNow() { render_(istToday(), 'MATRIX'); }
+function refreshNow() {
+  const day = istToday();
+  const res = fetchCsv_(day);
+  if (res) { render_(res, day, 'MATRIX'); return; }
+  /* No snapshot for today yet (before 9:20, or a holiday). Wipe any leftover
+     data from a previous day so yesterday's numbers are never mistaken for
+     today's — reference columns are rebuilt on the first real snapshot. */
+  clearStale_(day);
+}
 
-function loadDay(d)   { render_(d, 'MATRIX ' + d); }
+function loadDay(d) {
+  const res = fetchCsv_(d);
+  if (res) render_(res, d, 'MATRIX ' + d);
+  else console.log('no archived data for ' + d);
+}
 
 function testConnection() {
   const ss = book_();
@@ -46,15 +58,29 @@ function book_() {
 }
 
 
-function render_(day, tabName) {
+function fetchCsv_(day) {
   const res = UrlFetchApp.fetch(RAW + 'matrix_' + day + '.csv?cb=' + Date.now(),
                                 { muteHttpExceptions: true });
-  if (res.getResponseCode() !== 200) {
-    console.log('no data for ' + day + ' (HTTP ' + res.getResponseCode() + ')');
-    return;
-  }
+  if (res.getResponseCode() !== 200) return null;
   const rows = Utilities.parseCsv(res.getContentText());
-  if (!rows || rows.length < 2) { console.log('empty file'); return; }
+  return (rows && rows.length >= 2) ? rows : null;
+}
+
+/* Blank the MATRIX tab when there is no data for `day` yet, leaving a clear
+   note. Keeps the sheet honest at the start of every trading day. */
+function clearStale_(day) {
+  const ss = book_();
+  const sh = ss.getSheetByName('MATRIX');
+  if (!sh) { console.log('nothing to clear'); return; }
+  const stamp = sh.getRange(1, 1).getValue();
+  if (String(stamp).indexOf(day) === 0) { console.log('already cleared for ' + day); return; }
+  sh.clear();
+  sh.getRange(1, 1).setValue(day + '  —  waiting for first snapshot (9:20 IST)')
+    .setFontWeight('bold');
+  console.log('cleared stale data, ready for ' + day);
+}
+
+function render_(rows, day, tabName) {
 
   const nCol = rows[0].length;
   const out = [], colors = [];
