@@ -48,6 +48,10 @@ function tick() {
   // Paper trader: manage entries/exits every tick 9:28-11:05 IST
   if (hm >= 9 * 60 + 28 && hm <= 11 * 60 + 5) dispatch('paper.yml');
 
+  // F&O MATRIX — 10-minute snapshots, 9:18-15:40 IST
+  if (hm >= 9*60+18 && hm <= 15*60+40 && ist.getMinutes() % 10 < 5)
+    dispatch('matrix.yml');
+
   // Sheet data logger — every tick inside the window (one snapshot column
   // per run; re-running the same minute just overwrites that column).
   if (hm >= 9 * 60 + 15 && hm <= 15 * 60 + 35) dispatch('sheetlog.yml');
