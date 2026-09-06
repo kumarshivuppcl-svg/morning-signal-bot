@@ -1,5 +1,9 @@
 name: FnO Matrix
 on:
+  schedule:
+    # Every 10 minutes, 03:00-10:59 UTC = 08:30-16:29 IST, Mon-Fri.
+    # The script's own guard keeps only 9:18-15:40 IST snapshots.
+    - cron: "*/10 3-10 * * 1-5"
   workflow_dispatch: {}
 concurrency:
   group: fno-matrix
