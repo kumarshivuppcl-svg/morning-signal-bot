@@ -189,14 +189,21 @@ def option_data(symbols):
             atm = min(range(len(ks)), key=lambda i: abs(ks[i] - spot))
             sel = rows[max(0, atm - STRIKES): atm + STRIKES]
             cv = co = pv = po = 0
+            c_prev = p_prev = 0
             for z in sel:
                 ce, pe = z.get("CE") or {}, z.get("PE") or {}
+                _coi = int(float(ce.get("openInterest", 0) or 0))
+                _poi = int(float(pe.get("openInterest", 0) or 0))
                 cv += int(float(ce.get("totalTradedVolume", 0) or 0))
-                co += int(float(ce.get("openInterest", 0) or 0))
                 pv += int(float(pe.get("totalTradedVolume", 0) or 0))
-                po += int(float(pe.get("openInterest", 0) or 0))
+                co += _coi
+                po += _poi
+                # yesterday's OI = today's OI minus the change since yesterday
+                c_prev += _coi - int(float(ce.get("changeinOpenInterest", 0) or 0))
+                p_prev += _poi - int(float(pe.get("changeinOpenInterest", 0) or 0))
             return sym, {"call_vol": cv, "call_oi": co,
-                         "put_vol": pv, "put_oi": po}
+                         "put_vol": pv, "put_oi": po,
+                         "call_prev_oi": c_prev, "put_prev_oi": p_prev}
         except Exception:
             return sym, None
 
@@ -208,6 +215,46 @@ def option_data(symbols):
 
 
 # ------------------------------------------------------------- assemble -----
+def archive_finals(day):
+    """{(symbol, metric): final value} from the most recent PAST matrix CSV.
+    Used so FUT VOL / CALL VOL / PUT VOL (which NSE gives no yesterday value
+    for) still become ratios once we have one day of our own history."""
+    import glob as _g
+    files = sorted(_g.glob(os.path.join(DATA_D, "matrix_*.csv")))
+    files = [f for f in files if os.path.basename(f) < f"matrix_{day}.csv"]
+    if not files:
+        return {}, ""
+    prev_file = files[-1]
+    try:
+        d = pd.read_csv(prev_file, dtype=object)
+    except Exception:
+        return {}, ""
+    tcols = [c for c in d.columns if ":" in str(c)]
+    if not tcols:
+        return {}, ""
+    out = {}
+    for r in d.itertuples():
+        rd = r._asdict()
+        val = ""
+        for c in reversed(tcols):                 # last non-empty snapshot
+            v = str(rd.get(c, "") or "").strip()
+            if v:
+                val = v
+                break
+        if val:
+            try:
+                out[(rd["Symbol"], rd["Metric"])] = float(val)
+            except Exception:
+                pass
+    return out, os.path.basename(prev_file)[7:17]
+
+
+def _blank(v):
+    """True when a cell is genuinely empty (handles pandas NaN -> 'nan')."""
+    t = str(v).strip().lower()
+    return t in ("", "nan", "none")
+
+
 def path_for(day):
     return os.path.join(DATA_D, f"matrix_{day}.csv")
 
@@ -244,6 +291,10 @@ def main():
     opt  = option_data(syms);          print(f"  options {len(opt)}")
     deliv = delivery_ratio();          print(f"  deliv   {len(deliv)}")
 
+    finals, prev_day_label = archive_finals(day)
+    if finals:
+        print(f"  archive  {len(finals)} prior-day finals from {prev_day_label}")
+
     df = load_or_init(day, syms, deliv)
     key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
 
@@ -260,7 +311,7 @@ def main():
         c = cash.get(s)
         if c and c["yday"] > 0:
             put(s, "CASH VOL", round(c["today"] / c["yday"], 3))
-            if not str(df.at[key[(s, "CASH VOL")], "PrevDayRatio"]).strip():
+            if _blank(df.at[key[(s, "CASH VOL")], "PrevDayRatio"]):
                 if c["prev"] > 0:
                     df.at[key[(s, "CASH VOL")], "PrevDayRatio"] = round(c["yday"] / c["prev"], 3)
                 if c["yday_lasthr"] > 0:
@@ -270,15 +321,41 @@ def main():
         if f:
             if f.get("prev_oi"):
                 put(s, "FUT OI", round(f["latest_oi"] / f["prev_oi"], 3))
-                if not str(df.at[key[(s, "FUT OI")], "PrevDayRatio"]).strip():
+                if _blank(df.at[key[(s, "FUT OI")], "PrevDayRatio"]):
                     df.at[key[(s, "FUT OI")], "PrevDayRatio"] = round(
                         f["latest_oi"] / f["prev_oi"], 3)
             if f.get("volume"):
                 put(s, "FUT VOL", int(f["volume"]))
         o = opt.get(s)
         if o:
-            put(s, "CALL VOL", o["call_vol"]); put(s, "CALL OI", o["call_oi"])
-            put(s, "PUT VOL",  o["put_vol"]);  put(s, "PUT OI",  o["put_oi"])
+            put(s, "CALL VOL", o["call_vol"])
+            put(s, "PUT VOL",  o["put_vol"])
+            for side, oi_key, prev_key in (("CALL OI", "call_oi", "call_prev_oi"),
+                                           ("PUT OI",  "put_oi",  "put_prev_oi")):
+                prev = o.get(prev_key, 0)
+                if prev > 0:
+                    r = round(o[oi_key] / prev, 3)
+                    put(s, side, r)
+                    if _blank(df.at[key[(s, side)], "PrevDayRatio"]):
+                        df.at[key[(s, side)], "PrevDayRatio"] = r
+
+    # Convert raw-count rows (FUT VOL, CALL VOL, PUT VOL) into ratios using
+    # our own prior-day archive; leaves them blank on day one.
+    if finals:
+        for s_ in syms:
+            for metric in ("FUT VOL", "CALL VOL", "PUT VOL"):
+                i = key.get((s_, metric))
+                if i is None:
+                    continue
+                base = finals.get((s_, metric), 0)
+                cur = "" if _blank(df.at[i, col]) else str(df.at[i, col]).strip()
+                if base and cur:
+                    try:
+                        df.at[i, col] = round(float(cur) / base, 3)
+                        if _blank(df.at[i, "PrevDayRatio"]):
+                            df.at[i, "PrevDayRatio"] = round(base / base, 3)
+                    except Exception:
+                        pass
 
     df.to_csv(path_for(day), index=False)
     print(f"{col}  wrote {len(df)} rows x {len(df.columns)} cols -> matrix_{day}.csv")

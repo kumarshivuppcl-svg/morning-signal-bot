@@ -89,10 +89,18 @@ function render_(rows, day, tabName) {
   out.push(rows[0].slice());
   colors.push(rows[0].map(() => '#000000'));
 
+  let lastSym = '';
   for (let r = 1; r < rows.length; r++) {
     const src = rows[r], line = [], col = [];
     for (let c = 0; c < nCol; c++) {
-      const raw = (src[c] || '').trim();
+      let raw = (src[c] || '').trim();
+      if (c === 0) {                         /* symbol shown once per block */
+        const shown = (raw === lastSym) ? '' : raw;
+        lastSym = raw;
+        line.push(shown);
+        col.push('#111111');
+        continue;
+      }
       if (c < FIXED) {                       // label / prev-day columns
         line.push(raw);
         col.push(c < 2 ? '#111111' : tint_(raw));
