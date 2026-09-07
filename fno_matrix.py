@@ -215,14 +215,14 @@ def path_for(day):
 def load_or_init(day, symbols, deliv):
     p = path_for(day)
     if os.path.exists(p):
-        return pd.read_csv(p)
+        return pd.read_csv(p, dtype=object)
     rows = []
     for s in symbols:
         for m in METRICS:
             rows.append({"Symbol": s, "Metric": m,
                          "DelivRatio": deliv.get(s, "") if m == "CASH VOL" else "",
                          "PrevDayRatio": "", "PrevLastHrRatio": ""})
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).astype(object)
 
 
 def main():
@@ -254,6 +254,7 @@ def main():
 
     if col not in df.columns:
         df[col] = ""
+    df[col] = df[col].astype(object)
 
     for s in syms:
         c = cash.get(s)
