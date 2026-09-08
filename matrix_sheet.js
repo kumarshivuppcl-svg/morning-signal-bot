@@ -15,13 +15,20 @@
  */
 
 const SHEET_ID = 'PASTE_YOUR_SHEET_ID_HERE';
+const GH_TOKEN = 'PASTE_TOKEN_HERE';      /* now works - you own the repo */
 
-const RAW = 'https://raw.githubusercontent.com/shivuppcl/morning-signal-bot/master/data/';
+const REPO = 'kumarshivuppcl-svg/morning-signal-bot';
+const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 const FIXED = 5;                       // Symbol, Metric, Deliv, PrevDay, PrevLastHr
 
 
+/* Fires a fresh collection on GitHub, then pulls the latest CSV in.
+   Because collection takes ~2 minutes, the pull shows the PREVIOUS snapshot —
+   so each 10-minute run collects now and displays the last one. Your Google
+   trigger therefore drives the whole system; GitHub's own cron is just backup. */
 function refreshNow() {
+  collect_();
   const day = istToday();
   const res = fetchCsv_(day);
   if (res) { render_(res, day, 'MATRIX'); return; }
@@ -29,6 +36,43 @@ function refreshNow() {
      data from a previous day so yesterday's numbers are never mistaken for
      today's — reference columns are rebuilt on the first real snapshot. */
   clearStale_(day);
+}
+
+/* Ask GitHub to run a snapshot now. Non-fatal: if the token is missing or
+   rejected, we simply carry on and display whatever data already exists. */
+function collect_() {
+  if (!GH_TOKEN || GH_TOKEN.indexOf('PASTE') === 0) {
+    console.log('no token set - display only, no fresh collection');
+    return;
+  }
+  const ist = istNow_();
+  if (ist.getDay() === 0 || ist.getDay() === 6) return;
+  const hm = ist.getHours() * 60 + ist.getMinutes();
+  if (hm < 558 || hm > 940) { console.log('outside market hours'); return; }
+
+  const res = UrlFetchApp.fetch(
+    'https://api.github.com/repos/' + REPO + '/actions/workflows/matrix.yml/dispatches',
+    { method: 'post', contentType: 'application/json',
+      headers: { 'Authorization': 'Bearer ' + GH_TOKEN,
+                 'Accept': 'application/vnd.github+json' },
+      payload: JSON.stringify({ ref: 'master' }),
+      muteHttpExceptions: true });
+  console.log(res.getResponseCode() === 204
+    ? 'snapshot triggered'
+    : 'trigger failed HTTP ' + res.getResponseCode() + ' ' +
+      res.getContentText().slice(0, 120));
+}
+
+function istNow_() {
+  const n = new Date();
+  return new Date(n.getTime() + n.getTimezoneOffset() * 60000 + 19800000);
+}
+
+/* Pull only, no collection - use when you just want to redraw the sheet. */
+function pullOnly() {
+  const day = istToday();
+  const res = fetchCsv_(day);
+  if (res) render_(res, day, 'MATRIX'); else clearStale_(day);
 }
 
 function loadDay(d) {

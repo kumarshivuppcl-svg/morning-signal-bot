@@ -6,12 +6,28 @@ fno_matrix.py  --  the F&O data matrix (user-specified layout, Sep 2026)
 
   ROWS per script      SOURCE
     CASH VOL           yfinance (equity segment)
-    FUT VOL            NSE oi-spurts  (one call, all stocks)
+    FUT VOL            RAW COUNT, not yet a ratio -- see note below
     FUT OI             NSE oi-spurts
     CALL VOL           option chain, ATM +/-5 strikes, nearest expiry
     CALL OI            option chain, ATM +/-5 strikes
     PUT VOL            option chain, ATM +/-5 strikes
     PUT OI             option chain, ATM +/-5 strikes
+
+  FUT VOL note (verified 2026-09-08): the `volume` field on NSE's oi-spurts
+  feed is NOT futures traded volume -- it reconciles with neither contracts
+  nor shares against the F&O bhavcopy (RELIANCE: 152,183 reported vs 20,234
+  contracts / 10.1m shares actually traded). It is therefore written as a raw
+  count only. NSE's real live futures volume lives on
+  /api/liveEquity-derivatives?index=stock_fut but that returns only 20 rows,
+  and the per-symbol /api/quote-derivative endpoint now 404s -- so there is no
+  all-symbol live futures source yet. Yesterday's side IS solved
+  (prev_fno_volumes below); only the live numerator is missing.
+
+  Units, confirmed against the bhavcopy:
+    futures volume  bhavcopy TtlTradgVol is CONTRACTS (x NewBrdLotQty = shares)
+    option volume   bhavcopy TtlTradgVol and the option chain's
+                    totalTradedVolume are BOTH contracts -- directly divisible
+    option OI       bhavcopy OpnIntrst is SHARES, the chain's is contracts
 
   COLUMNS
     Symbol | Metric | DelivRatio | PrevDayRatio | PrevLastHrRatio | 09:20 | 09:30 | ... | 15:30
@@ -249,6 +265,77 @@ def archive_finals(day):
     return out, os.path.basename(prev_file)[7:17]
 
 
+def prev_fno_volumes():
+    """Yesterday's F&O volumes from NSE's derivatives bhavcopy, on the SAME
+    basis we measure today: futures = all stock-futures contracts; options =
+    ATM +/-5 strikes of the nearest expiry only.
+    Returns {sym: {"fut_vol", "call_vol", "put_vol"}} (empty on failure)."""
+    import io as _io, zipfile as _zip
+    from curl_cffi import requests as cffi
+    sess = cffi.Session(impersonate="chrome")
+
+    d = _now().date()
+    for _ in range(10):
+        d -= timedelta(days=1)
+        if d.weekday() >= 5:
+            continue
+        url = ("https://nsearchives.nseindia.com/content/fo/"
+               f"BhavCopy_NSE_FO_0_0_0_{d.strftime('%Y%m%d')}_F_0000.csv.zip")
+        try:
+            r = sess.get(url, timeout=30)
+        except Exception:
+            continue
+        if r.status_code != 200 or len(r.content) < 5000:
+            continue
+        try:
+            z = _zip.ZipFile(_io.BytesIO(r.content))
+            rows = list(csv.DictReader(
+                _io.TextIOWrapper(z.open(z.namelist()[0]), encoding="utf-8")))
+        except Exception:
+            continue
+
+        fut, opts = {}, {}
+        for x in rows:
+            sym = (x.get("TckrSymb") or "").strip()
+            tp  = (x.get("FinInstrmTp") or "").strip()
+            try:
+                vol = float(x.get("TtlTradgVol", 0) or 0)
+            except Exception:
+                continue
+            if tp == "STF":
+                fut[sym] = fut.get(sym, 0.0) + vol
+            elif tp == "STO":
+                try:
+                    k    = float(x.get("StrkPric", 0) or 0)
+                    spot = float(x.get("UndrlygPric", 0) or 0)
+                except Exception:
+                    continue
+                opts.setdefault(sym, []).append(
+                    (x.get("XpryDt", ""), k, (x.get("OptnTp") or "").strip(),
+                     vol, spot))
+
+        out = {}
+        for sym, recs in opts.items():
+            exps = sorted({e for e, *_ in recs if e})
+            if not exps:
+                continue
+            near = [r_ for r_ in recs if r_[0] == exps[0]]
+            spot = next((r_[4] for r_ in near if r_[4] > 0), 0)
+            ks   = sorted({r_[1] for r_ in near})
+            if not ks or spot <= 0:
+                continue
+            atm  = min(range(len(ks)), key=lambda i: abs(ks[i] - spot))
+            keep = set(ks[max(0, atm - STRIKES): atm + STRIKES])
+            cv = sum(r_[3] for r_ in near if r_[1] in keep and r_[2] == "CE")
+            pv = sum(r_[3] for r_ in near if r_[1] in keep and r_[2] == "PE")
+            out[sym] = {"call_vol": cv, "put_vol": pv}
+        for sym, v in fut.items():
+            out.setdefault(sym, {})["fut_vol"] = v
+        print(f"  prev F&O bhavcopy {d}: {len(out)} symbols")
+        return out
+    return {}
+
+
 def _blank(v):
     """True when a cell is genuinely empty (handles pandas NaN -> 'nan')."""
     t = str(v).strip().lower()
@@ -291,6 +378,8 @@ def main():
     opt  = option_data(syms);          print(f"  options {len(opt)}")
     deliv = delivery_ratio();          print(f"  deliv   {len(deliv)}")
 
+    prev_fo = prev_fno_volumes()
+    from_bhav = set()   # cells already turned into ratios by the bhavcopy baseline
     finals, prev_day_label = archive_finals(day)
     if finals:
         print(f"  archive  {len(finals)} prior-day finals from {prev_day_label}")
@@ -317,6 +406,7 @@ def main():
                 if c["yday_lasthr"] > 0:
                     df.at[key[(s, "CASH VOL")], "PrevLastHrRatio"] = round(
                         c["yday_lasthr"] / c["yday"], 3)
+        pf = prev_fo.get(s, {})
         f = fut.get(s)
         if f:
             if f.get("prev_oi"):
@@ -328,8 +418,16 @@ def main():
                 put(s, "FUT VOL", int(f["volume"]))
         o = opt.get(s)
         if o:
-            put(s, "CALL VOL", o["call_vol"])
-            put(s, "PUT VOL",  o["put_vol"])
+            for lbl, cur_key, base_key in (("CALL VOL", "call_vol", "call_vol"),
+                                           ("PUT VOL",  "put_vol",  "put_vol")):
+                base = pf.get(base_key, 0)
+                if base > 0:
+                    put(s, lbl, round(o[cur_key] / base, 3))
+                    if _blank(df.at[key[(s, lbl)], "PrevDayRatio"]):
+                        df.at[key[(s, lbl)], "PrevDayRatio"] = 1.0
+                    from_bhav.add((s, lbl))
+                else:
+                    put(s, lbl, o[cur_key])
             for side, oi_key, prev_key in (("CALL OI", "call_oi", "call_prev_oi"),
                                            ("PUT OI",  "put_oi",  "put_prev_oi")):
                 prev = o.get(prev_key, 0)
@@ -345,7 +443,7 @@ def main():
         for s_ in syms:
             for metric in ("FUT VOL", "CALL VOL", "PUT VOL"):
                 i = key.get((s_, metric))
-                if i is None:
+                if i is None or (s_, metric) in from_bhav:
                     continue
                 base = finals.get((s_, metric), 0)
                 cur = "" if _blank(df.at[i, col]) else str(df.at[i, col]).strip()

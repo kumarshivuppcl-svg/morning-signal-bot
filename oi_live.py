@@ -50,6 +50,7 @@ def fetch_oi_spurts() -> dict:
                 "prev_oi":    prev,
                 "chg_oi":     int(row.get("changeInOI", 0) or 0),
                 "chg_oi_pct": float(row.get("avgInOI", 0) or 0),
+                "volume":     int(float(row.get("volume", 0) or 0)),
                 "spot":       float(row.get("underlyingValue", 0) or 0),
             }
         return out
