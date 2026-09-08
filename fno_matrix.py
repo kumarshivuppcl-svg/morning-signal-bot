@@ -178,6 +178,19 @@ def _chain_session():
 _H = {"Referer": "https://www.nseindia.com/option-chain",
       "Accept": "application/json, text/plain, */*"}
 
+_MON = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05",
+        "Jun": "06", "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10",
+        "Nov": "11", "Dec": "12"}
+
+
+def _iso_expiry(e):
+    """'29-Sep-2026' -> '2026-09-29', matching the bhavcopy's XpryDt."""
+    try:
+        dd, mon, yy = str(e).strip().split("-")
+        return f"{yy}-{_MON[mon[:3].title()]}-{int(dd):02d}"
+    except Exception:
+        return ""
+
 
 def option_data(symbols):
     """{sym: {'call_vol','call_oi','put_vol','put_oi'}} over ATM +/-5 strikes."""
@@ -203,10 +216,15 @@ def option_data(symbols):
             rows = sorted(rows, key=lambda z: float(z.get("strikePrice", 0) or 0))
             ks = [float(z.get("strikePrice", 0) or 0) for z in rows]
             atm = min(range(len(ks)), key=lambda i: abs(ks[i] - spot))
-            sel = rows[max(0, atm - STRIKES): atm + STRIKES]
+            # Inclusive on BOTH sides: STRIKES below + ATM + STRIKES above.
+            # The slice end is exclusive, hence the +1 -- without it the window
+            # was 5 below / ATM / 4 above, i.e. quietly skewed to the downside.
+            sel = rows[max(0, atm - STRIKES): atm + STRIKES + 1]
             cv = co = pv = po = 0
             c_prev = p_prev = 0
+            sel_ks = []
             for z in sel:
+                sel_ks.append(float(z.get("strikePrice", 0) or 0))
                 ce, pe = z.get("CE") or {}, z.get("PE") or {}
                 _coi = int(float(ce.get("openInterest", 0) or 0))
                 _poi = int(float(pe.get("openInterest", 0) or 0))
@@ -217,9 +235,13 @@ def option_data(symbols):
                 # yesterday's OI = today's OI minus the change since yesterday
                 c_prev += _coi - int(float(ce.get("changeinOpenInterest", 0) or 0))
                 p_prev += _poi - int(float(pe.get("changeinOpenInterest", 0) or 0))
+            # `expiry` + `strikes` let the caller pull yesterday's volume for
+            # EXACTLY these contracts, so both sides of the ratio cover the
+            # same strike band even when the underlying has moved hard.
             return sym, {"call_vol": cv, "call_oi": co,
                          "put_vol": pv, "put_oi": po,
-                         "call_prev_oi": c_prev, "put_prev_oi": p_prev}
+                         "call_prev_oi": c_prev, "put_prev_oi": p_prev,
+                         "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
         except Exception:
             return sym, None
 
@@ -266,10 +288,14 @@ def archive_finals(day):
 
 
 def prev_fno_volumes():
-    """Yesterday's F&O volumes from NSE's derivatives bhavcopy, on the SAME
-    basis we measure today: futures = all stock-futures contracts; options =
-    ATM +/-5 strikes of the nearest expiry only.
-    Returns {sym: {"fut_vol", "call_vol", "put_vol"}} (empty on failure)."""
+    """Yesterday's F&O volumes from NSE's derivatives bhavcopy, kept at
+    per-contract granularity so the caller can sum exactly the strikes it
+    measured today (see prev_opt_vol).
+
+    Returns {sym: {"fut_vol": contracts,
+                   "ce": {(expiry_iso, strike): vol},
+                   "pe": {(expiry_iso, strike): vol},
+                   "spot": yesterday's underlying price}}   ({} on failure)."""
     import io as _io, zipfile as _zip
     from curl_cffi import requests as cffi
     sess = cffi.Session(impersonate="chrome")
@@ -294,7 +320,7 @@ def prev_fno_volumes():
         except Exception:
             continue
 
-        fut, opts = {}, {}
+        fut, ce, pe = {}, {}, {}
         for x in rows:
             sym = (x.get("TckrSymb") or "").strip()
             tp  = (x.get("FinInstrmTp") or "").strip()
@@ -306,34 +332,84 @@ def prev_fno_volumes():
                 fut[sym] = fut.get(sym, 0.0) + vol
             elif tp == "STO":
                 try:
-                    k    = float(x.get("StrkPric", 0) or 0)
-                    spot = float(x.get("UndrlygPric", 0) or 0)
+                    k = float(x.get("StrkPric", 0) or 0)
                 except Exception:
                     continue
-                opts.setdefault(sym, []).append(
-                    (x.get("XpryDt", ""), k, (x.get("OptnTp") or "").strip(),
-                     vol, spot))
+                ot  = (x.get("OptnTp") or "").strip()
+                tgt = ce if ot == "CE" else pe if ot == "PE" else None
+                if tgt is None:
+                    continue
+                m  = tgt.setdefault(sym, {})
+                kk = (x.get("XpryDt", ""), k)
+                m[kk] = m.get(kk, 0.0) + vol
+
+        spot = {}
+        for x in rows:
+            if (x.get("FinInstrmTp") or "").strip() == "STO":
+                try:
+                    v = float(x.get("UndrlygPric", 0) or 0)
+                except Exception:
+                    continue
+                if v > 0:
+                    spot.setdefault((x.get("TckrSymb") or "").strip(), v)
 
         out = {}
-        for sym, recs in opts.items():
-            exps = sorted({e for e, *_ in recs if e})
-            if not exps:
-                continue
-            near = [r_ for r_ in recs if r_[0] == exps[0]]
-            spot = next((r_[4] for r_ in near if r_[4] > 0), 0)
-            ks   = sorted({r_[1] for r_ in near})
-            if not ks or spot <= 0:
-                continue
-            atm  = min(range(len(ks)), key=lambda i: abs(ks[i] - spot))
-            keep = set(ks[max(0, atm - STRIKES): atm + STRIKES])
-            cv = sum(r_[3] for r_ in near if r_[1] in keep and r_[2] == "CE")
-            pv = sum(r_[3] for r_ in near if r_[1] in keep and r_[2] == "PE")
-            out[sym] = {"call_vol": cv, "put_vol": pv}
-        for sym, v in fut.items():
-            out.setdefault(sym, {})["fut_vol"] = v
-        print(f"  prev F&O bhavcopy {d}: {len(out)} symbols")
+        for sym in set(list(ce) + list(pe) + list(fut)):
+            out[sym] = {"ce": ce.get(sym, {}), "pe": pe.get(sym, {}),
+                        "fut_vol": fut.get(sym, 0.0),
+                        "spot": spot.get(sym, 0.0)}
+        print(f"  prev F&O bhavcopy {d}: {len(out)} symbols (per-contract)")
         return out
     return {}
+
+
+THIN = 0.25   # contract-matched base below this share of the moneyness-matched
+              # base means the strike band has moved into yesterday's dormant
+              # territory; dividing by it produces a huge, meaningless ratio.
+
+
+def _band_totals(pf, expiry, strikes):
+    cem, pem = pf.get("ce", {}), pf.get("pe", {})
+    cv = pv = 0.0
+    seen = 0
+    for k in strikes:
+        kk = (expiry, k)
+        if kk in cem or kk in pem:
+            seen += 1
+        cv += cem.get(kk, 0.0)
+        pv += pem.get(kk, 0.0)
+    return cv, pv, (seen / len(strikes) if strikes else 0.0)
+
+
+def prev_opt_vol(pf, expiry, strikes):
+    """Yesterday's CE/PE volume for the SAME expiry and the SAME strikes we
+    measured today, so a stock that has moved is not compared against a
+    different price band.
+
+    Guard: when those exact contracts were nearly dormant yesterday (a big
+    mover's new band sat far OTM), the contract-matched base collapses toward
+    zero and the ratio explodes on noise. In that case fall back to yesterday's
+    own ATM band -- same moneyness rather than same strike -- which is the
+    honest comparison when the strikes themselves have no history.
+
+    Returns (call_vol, put_vol, coverage, matched) where `matched` is True when
+    the strict contract-matched base was used."""
+    if not pf or not expiry or not strikes:
+        return 0.0, 0.0, 0.0, False
+    cv, pv, cover = _band_totals(pf, expiry, strikes)
+
+    ks = sorted({k for (e, k) in pf.get("ce", {}) if e == expiry} |
+                {k for (e, k) in pf.get("pe", {}) if e == expiry})
+    yspot = pf.get("spot", 0.0)
+    if not ks or yspot <= 0:
+        return cv, pv, cover, True
+    a = min(range(len(ks)), key=lambda i: abs(ks[i] - yspot))
+    yband = ks[max(0, a - STRIKES): a + STRIKES + 1]
+    ycv, ypv, _ = _band_totals(pf, expiry, yband)
+
+    if (ycv > 0 and cv < THIN * ycv) or (ypv > 0 and pv < THIN * ypv):
+        return ycv, ypv, cover, False
+    return cv, pv, cover, True
 
 
 def _blank(v):
@@ -418,10 +494,13 @@ def main():
                 put(s, "FUT VOL", int(f["volume"]))
         o = opt.get(s)
         if o:
-            for lbl, cur_key, base_key in (("CALL VOL", "call_vol", "call_vol"),
-                                           ("PUT VOL",  "put_vol",  "put_vol")):
-                base = pf.get(base_key, 0)
-                if base > 0:
+            # Same expiry, same strikes on both sides of the ratio, so a stock
+            # that has moved is not compared against a different price band.
+            b_cv, b_pv, cover, _exact = prev_opt_vol(pf, o.get("expiry"),
+                                                     o.get("strikes"))
+            for lbl, cur_key, base in (("CALL VOL", "call_vol", b_cv),
+                                       ("PUT VOL",  "put_vol",  b_pv)):
+                if base > 0 and cover >= 0.6:
                     put(s, lbl, round(o[cur_key] / base, 3))
                     if _blank(df.at[key[(s, lbl)], "PrevDayRatio"]):
                         df.at[key[(s, lbl)], "PrevDayRatio"] = 1.0
