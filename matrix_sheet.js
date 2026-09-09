@@ -1,9 +1,15 @@
 /**
  * F&O MATRIX  —  Google Sheet renderer
  *
- * Pulls the 10-minute matrix from GitHub and renders it the way you specified:
- *   7 rows per script (cash vol, futures vol/OI, call vol/OI, put vol/OI)
- *   every value a RATIO, with an arrow showing direction vs the previous cell.
+ * Pulls the 10-minute matrix from GitHub and renders it:
+ *   7 rows per script (cash vol, F&O vol/OI, call vol/OI, put vol/OI)
+ *   every value an ABSOLUTE number. Ratios are yours to compute in-sheet:
+ *   a time cell divided by that row's PrevDay is the headline ratio, and
+ *   having the raw figures means PCR, skew and the rest are one division too.
+ *
+ * NOTE: cumulative rows (the volume ones) only ever rise, so the cell-vs-cell
+ * arrow on them is always up and carries no information. It is meaningful on
+ * the OI rows, which move both ways.
  *
  * SETUP
  *  1. Copy your Sheet ID from its URL, between /d/ and /edit
@@ -20,7 +26,8 @@ const GH_TOKEN = 'PASTE_TOKEN_HERE';      /* now works - you own the repo */
 const REPO = 'kumarshivuppcl-svg/morning-signal-bot';
 const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
-const FIXED = 5;                       // Symbol, Metric, Deliv, PrevDay, PrevLastHr
+/* Symbol, Metric, PrevDay, PrevDay2, PrevLastHr, DelivPct, DelivPctPrev */
+const FIXED = 7;
 
 
 /* Fires a fresh collection on GitHub, then pulls the latest CSV in.
@@ -145,9 +152,11 @@ function render_(rows, day, tabName) {
         col.push('#111111');
         continue;
       }
-      if (c < FIXED) {                       // label / prev-day columns
+      /* Reference columns are absolute prior-session figures now, not ratios,
+         so the >1 green / <1 red tint no longer means anything here. */
+      if (c < FIXED) {
         line.push(raw);
-        col.push(c < 2 ? '#111111' : tint_(raw));
+        col.push('#111111');
         continue;
       }
       if (raw === '') { line.push(''); col.push('#000000'); continue; }
@@ -200,13 +209,6 @@ function render_(rows, day, tabName) {
 function fmt_(v) {
   if (Math.abs(v) >= 1000) return Math.round(v).toLocaleString('en-IN');
   return v.toFixed(2);
-}
-
-/** colour the prev-day ratio columns: >1 green, <1 red. */
-function tint_(raw) {
-  const v = parseFloat(raw);
-  if (isNaN(v)) return '#111111';
-  return v > 1 ? '#137333' : v < 1 ? '#B3261E' : '#111111';
 }
 
 function istToday() {

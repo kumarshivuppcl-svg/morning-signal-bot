@@ -2,43 +2,50 @@
 """
 fno_matrix.py  --  the F&O data matrix (user-specified layout, Sep 2026)
 =========================================================================
-7 rows per stock, one column per 10-minute snapshot. Every value is a RATIO.
+7 rows per stock, one column per 10-minute snapshot. Every value is an
+ABSOLUTE number -- ratios are computed in the sheet, not here.
 
-  ROWS per script      SOURCE
-    CASH VOL           yfinance (equity segment)
-    FUT VOL            RAW COUNT, not yet a ratio -- see note below
-    FUT OI             NSE oi-spurts
-    CALL VOL           option chain, ATM +/-5 strikes, nearest expiry
-    CALL OI            option chain, ATM +/-5 strikes
-    PUT VOL            option chain, ATM +/-5 strikes
-    PUT OI             option chain, ATM +/-5 strikes
-
-  FUT VOL note (verified 2026-09-08): the `volume` field on NSE's oi-spurts
-  feed is NOT futures traded volume -- it reconciles with neither contracts
-  nor shares against the F&O bhavcopy (RELIANCE: 152,183 reported vs 20,234
-  contracts / 10.1m shares actually traded). It is therefore written as a raw
-  count only. NSE's real live futures volume lives on
-  /api/liveEquity-derivatives?index=stock_fut but that returns only 20 rows,
-  and the per-symbol /api/quote-derivative endpoint now 404s -- so there is no
-  all-symbol live futures source yet. Yesterday's side IS solved
-  (prev_fno_volumes below); only the live numerator is missing.
-
-  Units, confirmed against the bhavcopy:
-    futures volume  bhavcopy TtlTradgVol is CONTRACTS (x NewBrdLotQty = shares)
-    option volume   bhavcopy TtlTradgVol and the option chain's
-                    totalTradedVolume are BOTH contracts -- directly divisible
-    option OI       bhavcopy OpnIntrst is SHARES, the chain's is contracts
+  ROWS per stock       TIME CELLS hold                 UNIT
+    CASH VOL           today's cumulative volume       shares
+    F&O VOL            today's cumulative volume       contracts (fut+opt)
+    F&O OI             current open interest           contracts (fut+opt)
+    CALL VOL           today's volume, ATM +/-5        contracts
+    CALL OI            current OI, ATM +/-5            contracts
+    PUT VOL            today's volume, ATM +/-5        contracts
+    PUT OI             current OI, ATM +/-5            contracts
 
   COLUMNS
-    Symbol | Metric | DelivRatio | PrevDayRatio | PrevLastHrRatio | 09:20 | 09:30 | ... | 15:30
+    Symbol | Metric | PrevDay | PrevDay2 | PrevLastHr | DelivPct |
+    DelivPctPrev | 09:20 | 09:30 | ... | 15:30
 
-    DelivRatio      prev day delivery %  /  day-before delivery %   (cash row only)
-    PrevDayRatio    prev day value       /  day-before value
-    PrevLastHrRatio prev day last hour   /  prev day whole day
-    time cells      today's cumulative   /  yesterday's full day     (a RATIO)
+    PrevDay       the previous session's figure -- full-day volume, or that
+                  session's closing OI. This is the denominator for the
+                  headline ratio:  time_cell / PrevDay
+    PrevDay2      the session before that, so prev-vs-prior is also local
+    PrevLastHr    previous session's 14:15-15:30 volume     (cash row only)
+    DelivPct      previous session's delivery %             (cash row only)
+    DelivPctPrev  the session before that                   (cash row only)
 
-Arrows (up/down vs the previous cell) are rendered by the Google Sheet script,
-so this CSV stays clean numbers.
+Why absolutes: a ratio cannot be un-divided, so storing one throws away both
+inputs and hides a bad denominator inside a plausible-looking number. That is
+exactly how 72 of 208 names silently ran against the wrong prior session --
+yfinance omits whole sessions and iloc[-2] then picks the day before last.
+Absolutes make the error visible and let any ratio, including PCR (which a
+ratio-of-ratios cannot express at all), be derived in the sheet.
+
+  Sources and units, verified against NSE's bhavcopies on 2026-09-08:
+    cash prev-day   NSE sec_bhavdata_full (NOT yfinance -- see nse_cash_prev)
+    F&O VOL / OI    oi-spurts, and these are futures PLUS options: RVNL
+                    futures 21,367 + options 25,116 = 46,483 = reported OI
+    option volume   bhavcopy TtlTradgVol and the chain's totalTradedVolume
+                    are BOTH contracts -- directly divisible
+    option OI       bhavcopy OpnIntrst is SHARES, the chain's is contracts
+    prev option OI  chain openInterest - changeinOpenInterest, exact to the
+                    contract against the bhavcopy (RVNL CE 11,817, PE 6,665)
+
+Note for the renderer: cumulative rows only ever rise, so a cell-vs-cell arrow
+on them is always up and says nothing. Draw arrows on the derived ratio or on
+the per-interval increment instead.
 """
 import os, sys, csv, time
 from urllib.parse import quote
@@ -53,12 +60,21 @@ from oi_live import fetch_oi_spurts
 IST      = timezone(timedelta(hours=5, minutes=30))
 DATA_D   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_D, exist_ok=True)
-STRIKES  = 5          # ATM +/- 5  = 10 strikes
+STRIKES  = 5          # ATM +/- 5, inclusive both sides = 11 strikes
 BATCH    = 25
 WORKERS  = 5          # parallel option-chain fetches (NSE-friendly)
 _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
-METRICS  = ["CASH VOL", "FUT VOL", "FUT OI",
+# Cells hold ABSOLUTE numbers, not ratios: a ratio cannot be un-divided, and a
+# wrong denominator is invisible inside one (72/208 names silently used the
+# wrong prior session before this). Yesterday's figures sit in REF so every
+# ratio -- plus PCR and anything else -- is a local division in the sheet.
+#
+# The two F&O rows are TOTALS (futures + options). Verified 2026-09-08 against
+# the bhavcopy: RVNL futures 21,367 + options 25,116 = 46,483, exactly the
+# figure NSE's oi-spurts feed reports. They are not futures-only.
+METRICS  = ["CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI"]
+REF      = ["PrevDay", "PrevDay2", "PrevLastHr", "DelivPct", "DelivPctPrev"]
 
 
 def _now():
@@ -77,8 +93,15 @@ def universe():
 
 
 # ---------------------------------------------------------------- cash ------
-def cash_data(symbols):
-    """{sym: {'today':cum, 'yday':vol, 'prev':vol, 'yday_lasthr':vol}}"""
+def cash_data(symbols, d1=None):
+    """{sym: {'today': cumulative shares, 'lasthr': d1's 14:15-15:30 shares}}
+
+    Yesterday's FULL-day volume deliberately does NOT come from here. yfinance
+    silently omits whole sessions -- 72 of 208 F&O names had no 2026-09-07 bar
+    -- and positional indexing (iloc[-2]) then picks the session before last
+    with no error. NSE's own bhavcopy supplies it instead; see nse_cash_prev().
+    `d1` is the real previous trading date, so the last-hour figure is matched
+    BY DATE and simply stays blank when yfinance lacks that session."""
     out = {}
     today = _now().strftime("%Y-%m-%d")
     for i in range(0, len(symbols), BATCH):
@@ -95,13 +118,21 @@ def cash_data(symbols):
         except Exception:
             m5 = None
         for x in b:
+            rec = {"today": 0.0, "lasthr": 0.0}
+            # Today's running total: the daily bar is the exchange's own figure
+            # and is more complete than summing 5-minute bars (RVNL: 1,901,031
+            # vs 1,791,416). Match it by date, never by position.
             try:
-                d = dl[x + ".NS"] if isinstance(dl.columns, pd.MultiIndex) else dl
-                v = d.dropna(subset=["Close"])["Volume"].astype(float)
-                if len(v) < 3:
-                    continue
-                rec = {"yday": float(v.iloc[-2]), "prev": float(v.iloc[-3]),
-                       "today": 0.0, "yday_lasthr": 0.0}
+                if dl is not None:
+                    d = dl[x + ".NS"] if isinstance(dl.columns, pd.MultiIndex) else dl
+                    d = d.dropna(subset=["Close"])
+                    for ts, row in d.iterrows():
+                        if str(ts)[:10] == today:
+                            rec["today"] = float(row["Volume"])
+                            break
+            except Exception:
+                pass
+            try:
                 if m5 is not None:
                     s = m5[x + ".NS"] if isinstance(m5.columns, pd.MultiIndex) else m5
                     s = s.reset_index()
@@ -110,21 +141,26 @@ def cash_data(symbols):
                     s["d"]  = s["dt"].dt.strftime("%Y-%m-%d")
                     s["hm"] = s["dt"].dt.strftime("%H:%M")
                     s = s.dropna(subset=["Close"])
-                    rec["today"] = float(s[s.d == today]["Volume"].fillna(0).sum())
-                    days = sorted(x for x in s["d"].unique() if x < today)
-                    if days:
-                        yd = s[s.d == days[-1]]
-                        rec["yday_lasthr"] = float(
-                            yd[yd.hm >= "14:15"]["Volume"].fillna(0).sum())
-                out[x] = rec
+                    if rec["today"] <= 0:
+                        rec["today"] = float(s[s.d == today]["Volume"].fillna(0).sum())
+                    if d1:
+                        yd = s[s.d == d1]
+                        if not yd.empty:
+                            rec["lasthr"] = float(
+                                yd[yd.hm >= "14:15"]["Volume"].fillna(0).sum())
             except Exception:
-                continue
+                pass
+            if rec["today"] > 0 or rec["lasthr"] > 0:
+                out[x] = rec
     return out
 
 
 # ------------------------------------------------------------- delivery -----
-def delivery_ratio():
-    """{sym: prev_day_deliv% / day_before_deliv%} from NSE bhavcopy."""
+def nse_cash_prev():
+    """The last two COMPLETED cash sessions, straight from NSE's bhavcopy --
+    the authoritative source for both volume and delivery, with no missing
+    sessions. Returns (sessions, dates), newest first, each session
+    {sym: {"vol": shares, "deliv": delivery %}}."""
     from curl_cffi import requests as cffi
     s = cffi.Session(impersonate="chrome")
 
@@ -135,21 +171,25 @@ def delivery_ratio():
             r = s.get(url, timeout=20)
             if r.status_code != 200 or len(r.content) < 500:
                 return {}
-            rows = list(csv.DictReader(r.text.splitlines()))
             out = {}
-            for x in rows:
+            for x in csv.DictReader(r.text.splitlines()):
                 k = {kk.strip(): vv for kk, vv in x.items() if kk}
                 if k.get("SERIES", "").strip() != "EQ":
                     continue
                 try:
-                    out[k["SYMBOL"].strip()] = float(k.get("DELIV_PER", 0) or 0)
+                    vol = float(k.get("TTL_TRD_QNTY", 0) or 0)
                 except Exception:
                     continue
+                try:                       # DELIV_PER is '-' for some scrips
+                    dp = float(k.get("DELIV_PER", 0) or 0)
+                except Exception:
+                    dp = 0.0
+                out[k["SYMBOL"].strip()] = {"vol": vol, "deliv": dp}
             return out
         except Exception:
             return {}
 
-    d, got = _now().date(), []
+    d, got, dates = _now().date(), [], []
     for _ in range(12):
         d -= timedelta(days=1)
         if d.weekday() >= 5:
@@ -157,13 +197,10 @@ def delivery_ratio():
         r = one(d)
         if r:
             got.append(r)
+            dates.append(d.strftime("%Y-%m-%d"))
         if len(got) == 2:
             break
-    if len(got) < 2:
-        return {}
-    prev, before = got[0], got[1]
-    return {k: round(prev[k] / before[k], 3)
-            for k in prev if before.get(k, 0) > 0}
+    return got, dates
 
 
 # -------------------------------------------------------------- options -----
@@ -253,114 +290,95 @@ def option_data(symbols):
 
 
 # ------------------------------------------------------------- assemble -----
-def archive_finals(day):
-    """{(symbol, metric): final value} from the most recent PAST matrix CSV.
-    Used so FUT VOL / CALL VOL / PUT VOL (which NSE gives no yesterday value
-    for) still become ratios once we have one day of our own history."""
-    import glob as _g
-    files = sorted(_g.glob(os.path.join(DATA_D, "matrix_*.csv")))
-    files = [f for f in files if os.path.basename(f) < f"matrix_{day}.csv"]
-    if not files:
-        return {}, ""
-    prev_file = files[-1]
-    try:
-        d = pd.read_csv(prev_file, dtype=object)
-    except Exception:
-        return {}, ""
-    tcols = [c for c in d.columns if ":" in str(c)]
-    if not tcols:
-        return {}, ""
-    out = {}
-    for r in d.itertuples():
-        rd = r._asdict()
-        val = ""
-        for c in reversed(tcols):                 # last non-empty snapshot
-            v = str(rd.get(c, "") or "").strip()
-            if v:
-                val = v
-                break
-        if val:
-            try:
-                out[(rd["Symbol"], rd["Metric"])] = float(val)
-            except Exception:
-                pass
-    return out, os.path.basename(prev_file)[7:17]
-
-
-def prev_fno_volumes():
-    """Yesterday's F&O volumes from NSE's derivatives bhavcopy, kept at
+def prev_fno_volumes(days=1):
+    """Completed F&O sessions from NSE's derivatives bhavcopy, kept at
     per-contract granularity so the caller can sum exactly the strikes it
     measured today (see prev_opt_vol).
 
-    Returns {sym: {"fut_vol": contracts,
-                   "ce": {(expiry_iso, strike): vol},
-                   "pe": {(expiry_iso, strike): vol},
-                   "spot": yesterday's underlying price}}   ({} on failure)."""
+    Returns (sessions, dates), newest first, each session
+        {sym: {"ce": {(expiry_iso, strike): vol},
+               "pe": {(expiry_iso, strike): vol},
+               "spot":    that day's underlying price,
+               "tot_vol": futures+options contracts traded,
+               "tot_oi":  futures+options open interest, contracts}}"""
     import io as _io, zipfile as _zip
     from curl_cffi import requests as cffi
     sess = cffi.Session(impersonate="chrome")
 
-    d = _now().date()
-    for _ in range(10):
-        d -= timedelta(days=1)
-        if d.weekday() >= 5:
-            continue
+    def one(d):
         url = ("https://nsearchives.nseindia.com/content/fo/"
                f"BhavCopy_NSE_FO_0_0_0_{d.strftime('%Y%m%d')}_F_0000.csv.zip")
         try:
             r = sess.get(url, timeout=30)
         except Exception:
-            continue
+            return None
         if r.status_code != 200 or len(r.content) < 5000:
-            continue
+            return None
         try:
             z = _zip.ZipFile(_io.BytesIO(r.content))
             rows = list(csv.DictReader(
                 _io.TextIOWrapper(z.open(z.namelist()[0]), encoding="utf-8")))
         except Exception:
-            continue
+            return None
 
-        fut, ce, pe = {}, {}, {}
+        ce, pe, spot, tv, toi, lot = {}, {}, {}, {}, {}, {}
         for x in rows:
+            tp = (x.get("FinInstrmTp") or "").strip()
+            if tp not in ("STF", "STO"):
+                continue
             sym = (x.get("TckrSymb") or "").strip()
-            tp  = (x.get("FinInstrmTp") or "").strip()
             try:
                 vol = float(x.get("TtlTradgVol", 0) or 0)
+                oi  = float(x.get("OpnIntrst", 0) or 0)
+                lq  = float(x.get("NewBrdLotQty", 0) or 0)
             except Exception:
                 continue
-            if tp == "STF":
-                fut[sym] = fut.get(sym, 0.0) + vol
-            elif tp == "STO":
-                try:
-                    k = float(x.get("StrkPric", 0) or 0)
-                except Exception:
-                    continue
-                ot  = (x.get("OptnTp") or "").strip()
-                tgt = ce if ot == "CE" else pe if ot == "PE" else None
-                if tgt is None:
-                    continue
-                m  = tgt.setdefault(sym, {})
-                kk = (x.get("XpryDt", ""), k)
-                m[kk] = m.get(kk, 0.0) + vol
-
-        spot = {}
-        for x in rows:
-            if (x.get("FinInstrmTp") or "").strip() == "STO":
-                try:
-                    v = float(x.get("UndrlygPric", 0) or 0)
-                except Exception:
-                    continue
-                if v > 0:
-                    spot.setdefault((x.get("TckrSymb") or "").strip(), v)
+            # Totals span futures AND options, matching what oi-spurts reports.
+            tv[sym]  = tv.get(sym, 0.0) + vol
+            toi[sym] = toi.get(sym, 0.0) + oi       # shares; -> contracts below
+            if lq > 0:
+                lot[sym] = lq
+            if tp != "STO":
+                continue
+            try:
+                k = float(x.get("StrkPric", 0) or 0)
+                u = float(x.get("UndrlygPric", 0) or 0)
+            except Exception:
+                continue
+            if u > 0:
+                spot.setdefault(sym, u)
+            ot  = (x.get("OptnTp") or "").strip()
+            tgt = ce if ot == "CE" else pe if ot == "PE" else None
+            if tgt is None:
+                continue
+            m  = tgt.setdefault(sym, {})
+            kk = (x.get("XpryDt", ""), k)
+            m[kk] = m.get(kk, 0.0) + vol
 
         out = {}
-        for sym in set(list(ce) + list(pe) + list(fut)):
+        for sym in set(list(tv) + list(ce) + list(pe)):
+            L = lot.get(sym, 0) or 1
             out[sym] = {"ce": ce.get(sym, {}), "pe": pe.get(sym, {}),
-                        "fut_vol": fut.get(sym, 0.0),
-                        "spot": spot.get(sym, 0.0)}
-        print(f"  prev F&O bhavcopy {d}: {len(out)} symbols (per-contract)")
+                        "spot": spot.get(sym, 0.0),
+                        "tot_vol": tv.get(sym, 0.0),
+                        "tot_oi":  toi.get(sym, 0.0) / L}
         return out
-    return {}
+
+    d, got, dates = _now().date(), [], []
+    for _ in range(12):
+        d -= timedelta(days=1)
+        if d.weekday() >= 5:
+            continue
+        r = one(d)
+        if r:
+            got.append(r)
+            dates.append(d.strftime("%Y-%m-%d"))
+        if len(got) >= days:
+            break
+    if got:
+        print(f"  prev F&O bhavcopy {', '.join(dates)}: "
+              f"{len(got[0])} symbols (per-contract)")
+    return got, dates
 
 
 THIN = 0.25   # contract-matched base below this share of the moneyness-matched
@@ -422,16 +440,24 @@ def path_for(day):
     return os.path.join(DATA_D, f"matrix_{day}.csv")
 
 
-def load_or_init(day, symbols, deliv):
+def load_or_init(day, symbols):
     p = path_for(day)
     if os.path.exists(p):
-        return pd.read_csv(p, dtype=object)
+        d = pd.read_csv(p, dtype=object)
+        # A file written by the ratio-era code has different reference columns
+        # AND ratio values in its time cells. Appending absolutes to it would
+        # leave one row holding both, which is worse than losing the morning:
+        # start the day again rather than mix the two.
+        if set(REF).issubset(d.columns):
+            return d
+        print(f"  {os.path.basename(p)} is in the old ratio format -- "
+              f"rebuilding as absolutes")
     rows = []
     for s in symbols:
         for m in METRICS:
-            rows.append({"Symbol": s, "Metric": m,
-                         "DelivRatio": deliv.get(s, "") if m == "CASH VOL" else "",
-                         "PrevDayRatio": "", "PrevLastHrRatio": ""})
+            r = {"Symbol": s, "Metric": m}
+            r.update({c: "" for c in REF})
+            rows.append(r)
     return pd.DataFrame(rows).astype(object)
 
 
@@ -449,18 +475,21 @@ def main():
     syms = universe()
     print(f"universe {len(syms)}")
 
-    cash = cash_data(syms);            print(f"  cash    {len(cash)}")
+    cashp, cdates = nse_cash_prev()
+    print(f"  cash bhavcopy {', '.join(cdates) or 'none'}")
+    d1 = cdates[0] if cdates else None
+
+    cash = cash_data(syms, d1);        print(f"  cash    {len(cash)}")
     fut  = fetch_oi_spurts();          print(f"  futures {len(fut)}")
     opt  = option_data(syms);          print(f"  options {len(opt)}")
-    deliv = delivery_ratio();          print(f"  deliv   {len(deliv)}")
+    fo, _fdates = prev_fno_volumes(days=2)
 
-    prev_fo = prev_fno_volumes()
-    from_bhav = set()   # cells already turned into ratios by the bhavcopy baseline
-    finals, prev_day_label = archive_finals(day)
-    if finals:
-        print(f"  archive  {len(finals)} prior-day finals from {prev_day_label}")
+    p1 = cashp[0] if len(cashp) > 0 else {}
+    p2 = cashp[1] if len(cashp) > 1 else {}
+    f1 = fo[0]    if len(fo)    > 0 else {}
+    f2 = fo[1]    if len(fo)    > 1 else {}
 
-    df = load_or_init(day, syms, deliv)
+    df = load_or_init(day, syms)
     key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
 
     def put(sym, metric, value):
@@ -468,72 +497,75 @@ def main():
         if i is not None:
             df.at[i, col] = value
 
+    def ref(sym, metric, column, value):
+        """Reference columns are yesterday's figures -- fixed for the whole
+        day, so only ever written once."""
+        i = key.get((sym, metric))
+        if i is not None and _blank(df.at[i, column]):
+            df.at[i, column] = value
+
+    for c in REF:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].astype(object)
     if col not in df.columns:
         df[col] = ""
     df[col] = df[col].astype(object)
 
     for s in syms:
+        # ---- cash: today's running total, yesterday's from NSE not yfinance
         c = cash.get(s)
-        if c and c["yday"] > 0:
-            put(s, "CASH VOL", round(c["today"] / c["yday"], 3))
-            if _blank(df.at[key[(s, "CASH VOL")], "PrevDayRatio"]):
-                if c["prev"] > 0:
-                    df.at[key[(s, "CASH VOL")], "PrevDayRatio"] = round(c["yday"] / c["prev"], 3)
-                if c["yday_lasthr"] > 0:
-                    df.at[key[(s, "CASH VOL")], "PrevLastHrRatio"] = round(
-                        c["yday_lasthr"] / c["yday"], 3)
-        pf = prev_fo.get(s, {})
+        if c:
+            if c["today"] > 0:
+                put(s, "CASH VOL", int(c["today"]))
+            if c["lasthr"] > 0:
+                ref(s, "CASH VOL", "PrevLastHr", int(c["lasthr"]))
+        if s in p1:
+            ref(s, "CASH VOL", "PrevDay",      int(p1[s]["vol"]))
+            ref(s, "CASH VOL", "DelivPct",     p1[s]["deliv"])
+        if s in p2:
+            ref(s, "CASH VOL", "PrevDay2",     int(p2[s]["vol"]))
+            ref(s, "CASH VOL", "DelivPctPrev", p2[s]["deliv"])
+
+        # ---- futures+options totals
         f = fut.get(s)
         if f:
-            if f.get("prev_oi"):
-                put(s, "FUT OI", round(f["latest_oi"] / f["prev_oi"], 3))
-                if _blank(df.at[key[(s, "FUT OI")], "PrevDayRatio"]):
-                    df.at[key[(s, "FUT OI")], "PrevDayRatio"] = round(
-                        f["latest_oi"] / f["prev_oi"], 3)
             if f.get("volume"):
-                put(s, "FUT VOL", int(f["volume"]))
+                put(s, "F&O VOL", int(f["volume"]))
+            if f.get("latest_oi"):
+                put(s, "F&O OI", int(f["latest_oi"]))
+            if f.get("prev_oi"):
+                ref(s, "F&O OI", "PrevDay", int(f["prev_oi"]))
+        if s in f1:
+            ref(s, "F&O VOL", "PrevDay",  int(f1[s]["tot_vol"]))
+        if s in f2:
+            ref(s, "F&O VOL", "PrevDay2", int(f2[s]["tot_vol"]))
+            ref(s, "F&O OI",  "PrevDay2", int(f2[s]["tot_oi"]))
+
+        # ---- options, ATM +/-STRIKES of the nearest expiry
         o = opt.get(s)
         if o:
-            # Same expiry, same strikes on both sides of the ratio, so a stock
-            # that has moved is not compared against a different price band.
-            b_cv, b_pv, cover, _exact = prev_opt_vol(pf, o.get("expiry"),
+            put(s, "CALL VOL", o["call_vol"])
+            put(s, "PUT VOL",  o["put_vol"])
+            put(s, "CALL OI",  o["call_oi"])
+            put(s, "PUT OI",   o["put_oi"])
+            # Yesterday's OI comes free with the chain: openInterest minus
+            # changeinOpenInterest. Verified exact against the bhavcopy.
+            if o.get("call_prev_oi"):
+                ref(s, "CALL OI", "PrevDay", o["call_prev_oi"])
+            if o.get("put_prev_oi"):
+                ref(s, "PUT OI",  "PrevDay", o["put_prev_oi"])
+            # Same expiry, same strikes on both sides, so a stock that has
+            # moved is not compared against a different price band.
+            b_cv, b_pv, cover, _exact = prev_opt_vol(f1.get(s), o.get("expiry"),
                                                      o.get("strikes"))
-            for lbl, cur_key, base in (("CALL VOL", "call_vol", b_cv),
-                                       ("PUT VOL",  "put_vol",  b_pv)):
-                if base > 0 and cover >= 0.6:
-                    put(s, lbl, round(o[cur_key] / base, 3))
-                    if _blank(df.at[key[(s, lbl)], "PrevDayRatio"]):
-                        df.at[key[(s, lbl)], "PrevDayRatio"] = 1.0
-                    from_bhav.add((s, lbl))
-                else:
-                    put(s, lbl, o[cur_key])
-            for side, oi_key, prev_key in (("CALL OI", "call_oi", "call_prev_oi"),
-                                           ("PUT OI",  "put_oi",  "put_prev_oi")):
-                prev = o.get(prev_key, 0)
-                if prev > 0:
-                    r = round(o[oi_key] / prev, 3)
-                    put(s, side, r)
-                    if _blank(df.at[key[(s, side)], "PrevDayRatio"]):
-                        df.at[key[(s, side)], "PrevDayRatio"] = r
+            if b_cv > 0 and cover >= 0.6:
+                ref(s, "CALL VOL", "PrevDay", int(b_cv))
+            if b_pv > 0 and cover >= 0.6:
+                ref(s, "PUT VOL",  "PrevDay", int(b_pv))
 
-    # Convert raw-count rows (FUT VOL, CALL VOL, PUT VOL) into ratios using
-    # our own prior-day archive; leaves them blank on day one.
-    if finals:
-        for s_ in syms:
-            for metric in ("FUT VOL", "CALL VOL", "PUT VOL"):
-                i = key.get((s_, metric))
-                if i is None or (s_, metric) in from_bhav:
-                    continue
-                base = finals.get((s_, metric), 0)
-                cur = "" if _blank(df.at[i, col]) else str(df.at[i, col]).strip()
-                if base and cur:
-                    try:
-                        df.at[i, col] = round(float(cur) / base, 3)
-                        if _blank(df.at[i, "PrevDayRatio"]):
-                            df.at[i, "PrevDayRatio"] = round(base / base, 3)
-                    except Exception:
-                        pass
-
+    df = df[["Symbol", "Metric"] + REF +
+            [c for c in df.columns if ":" in str(c)]]
     df.to_csv(path_for(day), index=False)
     print(f"{col}  wrote {len(df)} rows x {len(df.columns)} cols -> matrix_{day}.csv")
 
