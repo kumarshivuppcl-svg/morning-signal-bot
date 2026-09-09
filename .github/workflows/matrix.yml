@@ -20,6 +20,9 @@ jobs:
         with: {python-version: "3.12"}
       - run: pip install -r requirements.txt
       - run: python fno_matrix.py
+      # Ranking reads the matrix it just wrote; a failure here must not cost
+      # us the snapshot, which is the part that cannot be recreated later.
+      - run: python rank_top.py || true
       - name: Commit snapshot
         run: |
           git config user.name "matrix-bot"

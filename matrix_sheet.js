@@ -2,7 +2,7 @@
  * F&O MATRIX  —  Google Sheet renderer
  *
  * Pulls the 10-minute matrix from GitHub and renders it:
- *   7 rows per script (cash vol, F&O vol/OI, call vol/OI, put vol/OI)
+ *   8 rows per script (price, cash vol, F&O vol/OI, call vol/OI, put vol/OI)
  *   every value an ABSOLUTE number. Ratios are yours to compute in-sheet:
  *   a time cell divided by that row's PrevDay is the headline ratio, and
  *   having the raw figures means PCR, skew and the rest are one division too.
@@ -28,6 +28,7 @@ const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 /* Symbol, Metric, PrevDay, PrevDay2, PrevLastHr, DelivPct, DelivPctPrev */
 const FIXED = 7;
+const BLOCK = 8;   /* rows per stock - keep in step with METRICS */
 
 
 /* Fires a fresh collection on GitHub, then pulls the latest CSV in.
@@ -194,10 +195,10 @@ function render_(rows, day, tabName) {
   sh.setColumnWidth(1, 110);
   sh.setColumnWidth(2, 80);
 
-  // alternate shading per 7-row script block so stocks read as groups
-  for (let r = 1; r < out.length; r += 7) {
-    if (((r - 1) / 7) % 2 === 1) {
-      sh.getRange(r + 1, 1, Math.min(7, out.length - r), nCol)
+  // alternate shading per stock block so stocks read as groups
+  for (let r = 1; r < out.length; r += BLOCK) {
+    if (((r - 1) / BLOCK) % 2 === 1) {
+      sh.getRange(r + 1, 1, Math.min(BLOCK, out.length - r), nCol)
         .setBackground('#F1F3F4');
     }
   }

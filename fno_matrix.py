@@ -6,6 +6,7 @@ fno_matrix.py  --  the F&O data matrix (user-specified layout, Sep 2026)
 ABSOLUTE number -- ratios are computed in the sheet, not here.
 
   ROWS per stock       TIME CELLS hold                 UNIT
+    PRICE              live spot                       rupees
     CASH VOL           today's cumulative volume       shares
     F&O VOL            today's cumulative volume       contracts (fut+opt)
     F&O OI             current open interest           contracts (fut+opt)
@@ -18,10 +19,12 @@ ABSOLUTE number -- ratios are computed in the sheet, not here.
     Symbol | Metric | PrevDay | PrevDay2 | PrevLastHr | DelivPct |
     DelivPctPrev | 09:20 | 09:30 | ... | 15:30
 
-    PrevDay       the previous session's figure -- full-day volume, or that
-                  session's closing OI. This is the denominator for the
-                  headline ratio:  time_cell / PrevDay
-    PrevDay2      the session before that, so prev-vs-prior is also local
+    PrevDay       the previous session's figure -- full-day volume, closing
+                  OI, or closing price. Denominator for the headline ratio:
+                  time_cell / PrevDay   (and for PRICE, the day's % change)
+    PrevDay2      the session before that. Averaging the two gives a steadier
+                  denominator: 36 of 208 names had the two differing by more
+                  than 2x on 2026-09-09, which alone reshuffles a top-15.
     PrevLastHr    previous session's 14:15-15:30 volume     (cash row only)
     DelivPct      previous session's delivery %             (cash row only)
     DelivPctPrev  the session before that                   (cash row only)
@@ -72,7 +75,9 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # The two F&O rows are TOTALS (futures + options). Verified 2026-09-08 against
 # the bhavcopy: RVNL futures 21,367 + options 25,116 = 46,483, exactly the
 # figure NSE's oi-spurts feed reports. They are not futures-only.
-METRICS  = ["CASH VOL", "F&O VOL", "F&O OI",
+# PRICE leads each block: OI rising means opposite things depending on which
+# way price is going, so a buildup cannot be read without it.
+METRICS  = ["PRICE", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI"]
 REF      = ["PrevDay", "PrevDay2", "PrevLastHr", "DelivPct", "DelivPctPrev"]
 
@@ -184,7 +189,11 @@ def nse_cash_prev():
                     dp = float(k.get("DELIV_PER", 0) or 0)
                 except Exception:
                     dp = 0.0
-                out[k["SYMBOL"].strip()] = {"vol": vol, "deliv": dp}
+                try:
+                    cl = float(k.get("CLOSE_PRICE", 0) or 0)
+                except Exception:
+                    cl = 0.0
+                out[k["SYMBOL"].strip()] = {"vol": vol, "deliv": dp, "close": cl}
             return out
         except Exception:
             return {}
@@ -460,7 +469,19 @@ def load_or_init(day, symbols):
         # leave one row holding both, which is worse than losing the morning:
         # start the day again rather than mix the two.
         if set(REF).issubset(d.columns):
-            return d
+            # A metric added since the file was created (PRICE) is appended
+            # rather than triggering a rebuild, so the day's snapshots survive.
+            have = set(zip(d["Symbol"], d["Metric"]))
+            gap  = [{"Symbol": s, "Metric": m}
+                    for s in symbols for m in METRICS if (s, m) not in have]
+            if gap:
+                d = pd.concat([d, pd.DataFrame(gap)], ignore_index=True)
+                order = {m: i for i, m in enumerate(METRICS)}
+                d["_o"] = d["Metric"].map(order).fillna(len(order))
+                d = (d.sort_values(["Symbol", "_o"], kind="stable")
+                       .drop(columns="_o").reset_index(drop=True))
+                print(f"  added {len(gap)} rows for new metrics")
+            return d.astype(object)
         print(f"  {os.path.basename(p)} is in the old ratio format -- "
               f"rebuilding as absolutes")
     rows = []
@@ -534,13 +555,19 @@ def main():
         if s in p1:
             ref(s, "CASH VOL", "PrevDay",      int(p1[s]["vol"]))
             ref(s, "CASH VOL", "DelivPct",     p1[s]["deliv"])
+            if p1[s].get("close"):
+                ref(s, "PRICE", "PrevDay", p1[s]["close"])
         if s in p2:
             ref(s, "CASH VOL", "PrevDay2",     int(p2[s]["vol"]))
             ref(s, "CASH VOL", "DelivPctPrev", p2[s]["deliv"])
+            if p2[s].get("close"):
+                ref(s, "PRICE", "PrevDay2", p2[s]["close"])
 
         # ---- futures+options totals
         f = fut.get(s)
         if f:
+            if f.get("spot"):
+                put(s, "PRICE", f["spot"])
             if f.get("volume"):
                 put(s, "F&O VOL", int(f["volume"]))
             if f.get("latest_oi"):
