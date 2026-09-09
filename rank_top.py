@@ -48,6 +48,19 @@ def _series(df, metric, column):
     return pd.to_numeric(s[column], errors="coerce")
 
 
+def _latest(df, metric, tcols):
+    """Each metric's most recent value, which is not always the newest column.
+    A metric added part-way through a session (PRICE and VWAP both were) is
+    blank in the columns written before it existed, and reading a fixed column
+    would report it missing for the whole day."""
+    s = df[df.Metric == metric].set_index("Symbol")
+    have = [c for c in tcols if c in s.columns]
+    if not have:
+        return pd.Series(dtype=float)
+    v = s[have].apply(pd.to_numeric, errors="coerce")
+    return v.ffill(axis=1).iloc[:, -1]
+
+
 def build(day=None, top_n=TOP_N):
     day = day or datetime.now(IST).strftime("%Y-%m-%d")
     path = os.path.join(DATA_D, f"matrix_{day}.csv")
@@ -68,19 +81,22 @@ def build(day=None, top_n=TOP_N):
 
     first = tcols[0]
     g = lambda m, c: _series(df, m, c)
+    L = lambda m: _latest(df, m, tcols)
     T = pd.DataFrame({
-        "price":  g("PRICE",    now),   "pc1": g("PRICE",    "PrevDay"),
-        "open":   g("PRICE",    "Open"),
+        "price":  L("PRICE"),           "pc1": g("PRICE",    "PrevDay"),
+        "open":   g("PRICE",    "Open"), "vwap": L("VWAP"),
+        "dTC":    g("PRICE",    "dTC"), "dBC":  g("PRICE",   "dBC"),
+        "wTC":    g("PRICE",    "wTC"), "wBC":  g("PRICE",   "wBC"),
         "oi0":    g("F&O OI",   first),
-        "cash":   g("CASH VOL", now),
+        "cash":   L("CASH VOL"),
         "cp1":    g("CASH VOL", "PrevDay"), "cp2": g("CASH VOL", "PrevDay2"),
-        "oi":     g("F&O OI",   now),
+        "oi":     L("F&O OI"),
         "op1":    g("F&O OI",   "PrevDay"), "op2": g("F&O OI",   "PrevDay2"),
-        "cvol":   g("CALL VOL", now),
+        "cvol":   L("CALL VOL"),
         "cv1":    g("CALL VOL", "PrevDay"), "cv2": g("CALL VOL", "PrevDay2"),
-        "pvol":   g("PUT VOL",  now),
+        "pvol":   L("PUT VOL"),
         "pv1":    g("PUT VOL",  "PrevDay"), "pv2": g("PUT VOL",  "PrevDay2"),
-        "coi":    g("CALL OI",  now),   "poi": g("PUT OI", now),
+        "coi":    L("CALL OI"),         "poi": L("PUT OI"),
         "dlv":    g("CASH VOL", "DelivPct"),
         "dlv2":   g("CASH VOL", "DelivPctPrev"),
     })
@@ -136,9 +152,28 @@ def build(day=None, top_n=TOP_N):
     T["SESS"] = [state(c, (o > 1.002) if pd.notna(o) else None)
                  for c, o in zip(T.OPN, sess_oi)]
 
+    # Distance from the session VWAP, signed: positive means trading above the
+    # day's average traded price. VWAP is where the day's volume actually
+    # changed hands, so it is the level most participants are measured against.
+    T["VWP"] = ((T.price / T.vwap - 1) * 100).where(T.vwap > 0)
+
+    def zone(px, tc, bc):
+        """Where price sits against a Central Pivot Range."""
+        if pd.isna(px) or pd.isna(tc) or pd.isna(bc):
+            return ""
+        hi, lo = max(tc, bc), min(tc, bc)
+        return "ABOVE" if px > hi else "BELOW" if px < lo else "INSIDE"
+
+    T["DCPR"] = [zone(p, a, b) for p, a, b in zip(T.price, T.dTC, T.dBC)]
+    T["WCPR"] = [zone(p, a, b) for p, a, b in zip(T.price, T.wTC, T.wBC)]
+    # Range width relative to price. A narrow CPR (roughly under 0.5%) is the
+    # classic trending-day setup; a wide one implies a rangebound day.
+    T["DCW"] = ((T.dTC - T.dBC).abs() / T.price * 100).where(T.price > 0)
+
     out = T.sort_values("SCORE", ascending=False).head(top_n)
     cols = ["SCORE", "VOL", "OPT", "OIC", "GAP", "OPN", "CHG", "SOI",
-            "PCR", "LEV", "DLV", "BUILD", "SESS"]
+            "VWP", "DCW", "PCR", "LEV", "DLV", "BUILD", "SESS",
+            "DCPR", "WCPR"]
     out = out[cols].round(3)
     out.insert(0, "Rank", range(1, len(out) + 1))
     out.index.name = "Symbol"
@@ -156,12 +191,13 @@ if __name__ == "__main__":
         out, now, day = r
         print()
         print(f"{'#':<3}{'SYM':<12}{'SCORE':>6}{'VOL':>6}{'OPT':>7}{'OIC':>7}"
-              f"{'GAP%':>7}{'OPEN%':>7}{'CHG%':>7}{'sOI':>6}{'PCR':>6}"
-              f"{'LEV':>6}  {'BUILD (day)':<12} SESSION")
+              f"{'GAP%':>7}{'OPEN%':>7}{'CHG%':>7}{'vsVWAP':>8}{'cprW%':>7}"
+              f"  {'dCPR':<7}{'wCPR':<7}{'BUILD (day)':<13}SESSION")
         for s, x in out.iterrows():
             f = lambda v, w, p=2: (f"{v:>{w}.{p}f}" if pd.notna(v)
                                    else " " * (w - 1) + "-")
             print(f"{int(x.Rank):<3}{s:<12}{f(x.SCORE,6,3)}{f(x.VOL,6)}"
                   f"{f(x.OPT,7)}{f(x.OIC,7,3)}{f(x.GAP,7)}{f(x.OPN,7)}"
-                  f"{f(x.CHG,7)}{f(x.SOI,6,3)}{f(x.PCR,6)}{f(x.LEV,6)}"
-                  f"  {str(x.BUILD):<12} {x.SESS}")
+                  f"{f(x.CHG,7)}{f(x.VWP,8)}{f(x.DCW,7,3)}"
+                  f"  {str(x.DCPR):<7}{str(x.WCPR):<7}"
+                  f"{str(x.BUILD):<13}{x.SESS}")

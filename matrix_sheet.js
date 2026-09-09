@@ -2,7 +2,7 @@
  * F&O MATRIX  —  Google Sheet renderer
  *
  * Pulls the 10-minute matrix from GitHub and renders it:
- *   8 rows per script (price, cash vol, F&O vol/OI, call vol/OI, put vol/OI)
+ *   9 rows per script (price, vwap, cash vol, F&O vol/OI, call vol/OI, put vol/OI)
  *   every value an ABSOLUTE number. Ratios are yours to compute in-sheet:
  *   a time cell divided by that row's PrevDay is the headline ratio, and
  *   having the raw figures means PCR, skew and the rest are one division too.
@@ -28,7 +28,7 @@ const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 /* Symbol, Metric, PrevDay, PrevDay2, PrevLastHr, DelivPct, DelivPctPrev */
 const FIXED = 7;
-const BLOCK = 8;   /* rows per stock - keep in step with METRICS */
+const BLOCK = 9;   /* rows per stock - keep in step with METRICS */
 
 
 /* Fires a fresh collection on GitHub, then pulls the latest CSV in.
@@ -62,22 +62,24 @@ function renderTop_(day) {
      silently shift the values under the headings. */
   const h = {}; rows[0].forEach(function (n, i) { h[String(n).trim()] = i; });
   const need = ['Symbol', 'Rank', 'SCORE', 'VOL', 'OPT', 'OIC', 'GAP', 'OPN',
-                'CHG', 'SOI', 'PCR', 'LEV', 'DLV', 'BUILD', 'SESS'];
+                'CHG', 'SOI', 'VWP', 'DCW', 'PCR', 'LEV', 'DLV', 'BUILD',
+                'SESS', 'DCPR', 'WCPR'];
   for (let i = 0; i < need.length; i++) {
     if (h[need[i]] === undefined) { console.log('ranking missing column ' + need[i]); return false; }
   }
 
   const HEAD = ['#', 'SYMBOL', 'SCORE', 'VOL x', 'OPT x', 'OI x', 'GAP %',
-                'OPEN %', 'CHG %', 'sOI', 'PCR', 'LEV', 'DELIV Δ',
-                'BUILD (day)', 'SESSION'];
+                'OPEN %', 'CHG %', 'sOI', 'vs VWAP', 'CPR w%', 'PCR', 'LEV',
+                'DELIV Δ', 'dCPR', 'wCPR', 'BUILD (day)', 'SESSION'];
   const out = [HEAD];
   const num = function (v) { const x = parseFloat(v); return isNaN(x) ? '' : x; };
   for (let i = 1; i < rows.length; i++) {
     const s = rows[i];
     out.push([num(s[h.Rank]), s[h.Symbol], num(s[h.SCORE]), num(s[h.VOL]),
               num(s[h.OPT]), num(s[h.OIC]), num(s[h.GAP]), num(s[h.OPN]),
-              num(s[h.CHG]), num(s[h.SOI]), num(s[h.PCR]), num(s[h.LEV]),
-              num(s[h.DLV]), s[h.BUILD], s[h.SESS]]);
+              num(s[h.CHG]), num(s[h.SOI]), num(s[h.VWP]), num(s[h.DCW]),
+              num(s[h.PCR]), num(s[h.LEV]), num(s[h.DLV]),
+              s[h.DCPR], s[h.WCPR], s[h.BUILD], s[h.SESS]]);
   }
 
   const ss = book_();
@@ -97,7 +99,10 @@ function renderTop_(day) {
     .setFontWeight('bold').setFontSize(11);
   sh.getRange(2, 1).setValue('GAP% = open vs prev close   OPEN% = now vs '
       + 'today\'s open   CHG% = now vs prev close      BUILD reads the whole '
-      + 'day, SESSION reads since the open - bold where they disagree')
+      + 'day, SESSION reads since the open - bold where they disagree.   '
+      + 'vs VWAP = above(+)/below(-) the average traded price so far.   '
+      + 'dCPR/wCPR = price vs the daily/weekly central pivot range; CPR w% is '
+      + 'its width, narrow (bold) implies a trending day')
     .setFontSize(9).setFontColor('#5F6368');
 
   const n = out.length, w = HEAD.length;
@@ -111,20 +116,26 @@ function renderTop_(day) {
   sh.getRange(4, 4, n - 1, 6).setNumberFormat('0.00');    /* VOL..OPEN% */
   sh.getRange(4, 9, n - 1, 1).setNumberFormat('0.00');    /* CHG% */
   sh.getRange(4, 10, n - 1, 1).setNumberFormat('0.000');  /* sOI */
-  sh.getRange(4, 11, n - 1, 2).setNumberFormat('0.00');   /* PCR, LEV */
-  sh.getRange(4, 13, n - 1, 1).setNumberFormat('0.0');    /* DELIV */
+  sh.getRange(4, 11, n - 1, 1).setNumberFormat('0.00');   /* vs VWAP */
+  sh.getRange(4, 12, n - 1, 1).setNumberFormat('0.000');  /* CPR width */
+  sh.getRange(4, 13, n - 1, 2).setNumberFormat('0.00');   /* PCR, LEV */
+  sh.getRange(4, 15, n - 1, 1).setNumberFormat('0.0');    /* DELIV */
   sh.getRange(4, 2, n - 1, 1).setFontWeight('bold');
 
   const stateColor = function (b) {
     return b === 'LONG BUILD'  ? '#137333' : b === 'SHORT BUILD' ? '#B3261E' :
            b === 'SHORT COVER' ? '#1A73E8' : '#B06000';
   };
+  const zoneColor = function (z) {
+    return z === 'ABOVE' ? '#137333' : z === 'BELOW' ? '#B3261E' : '#5F6368';
+  };
 
   for (let i = 1; i < n; i++) {
     const row = out[i], at = 3 + i;
-    /* GAP, OPEN and CHG each green or red by sign: the three together say
-       whether a move is the gap, the session, or both. */
-    [6, 7, 8].forEach(function (k) {
+    /* GAP, OPEN, CHG and vs-VWAP each green or red by sign. The first three
+       say whether a move is the gap, the session, or both; vs-VWAP says which
+       side of the day's average traded price it is happening on. */
+    [6, 7, 8, 10].forEach(function (k) {
       if (row[k] !== '') {
         sh.getRange(at, k + 1).setFontColor(
           row[k] > 0 ? '#137333' : row[k] < 0 ? '#B3261E' : '#111111');
@@ -134,15 +145,22 @@ function renderTop_(day) {
        derivatives; a low value on a big VOL is block or index flow. */
     if (row[3] !== '' && row[3] >= 2) sh.getRange(at, 4).setFontWeight('bold');
     if (row[4] !== '' && row[4] >= 2) sh.getRange(at, 5).setFontWeight('bold');
-    if (row[11] !== '' && row[11] >= 2) sh.getRange(at, 12).setFontWeight('bold');
+    if (row[13] !== '' && row[13] >= 2) sh.getRange(at, 14).setFontWeight('bold');
+    /* A narrow central pivot range is the classic trending-day setup. */
+    if (row[11] !== '' && row[11] < 0.3) {
+      sh.getRange(at, 12).setFontWeight('bold').setFontColor('#B06000');
+    }
 
-    const bDay = String(row[13]), bSess = String(row[14]);
-    sh.getRange(at, 14).setFontColor(stateColor(bDay));
-    sh.getRange(at, 15).setFontColor(stateColor(bSess));
+    sh.getRange(at, 16).setFontColor(zoneColor(String(row[15])));
+    sh.getRange(at, 17).setFontColor(zoneColor(String(row[16])));
+
+    const bDay = String(row[17]), bSess = String(row[18]);
+    sh.getRange(at, 18).setFontColor(stateColor(bDay));
+    sh.getRange(at, 19).setFontColor(stateColor(bSess));
     /* The two frames disagreeing IS the signal - the day was built one way
        and the session is going the other. Bold it so it cannot be missed. */
     if (bDay && bSess && bDay !== bSess) {
-      sh.getRange(at, 14, 1, 2).setFontWeight('bold');
+      sh.getRange(at, 18, 1, 2).setFontWeight('bold');
     }
     if (i % 2 === 0) sh.getRange(at, 1, 1, w).setBackground('#F1F3F4');
   }
@@ -151,9 +169,11 @@ function renderTop_(day) {
   sh.setFrozenColumns(2);
   sh.setColumnWidth(1, 34);
   sh.setColumnWidth(2, 106);
-  for (let c = 3; c <= 13; c++) sh.setColumnWidth(c, 58);
-  sh.setColumnWidth(14, 104);
-  sh.setColumnWidth(15, 104);
+  for (let c = 3; c <= 15; c++) sh.setColumnWidth(c, 56);
+  sh.setColumnWidth(16, 62);
+  sh.setColumnWidth(17, 62);
+  sh.setColumnWidth(18, 104);
+  sh.setColumnWidth(19, 104);
   console.log('TOP 15 rendered for ' + day);
   return true;
 }

@@ -77,10 +77,13 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # figure NSE's oi-spurts feed reports. They are not futures-only.
 # PRICE leads each block: OI rising means opposite things depending on which
 # way price is going, so a buildup cannot be read without it.
-METRICS  = ["PRICE", "CASH VOL", "F&O VOL", "F&O OI",
+METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI"]
+# dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
+# on the PRICE row. They are fixed for the whole day (and week), so they are
+# fetched once and left alone -- see pivot_range().
 REF      = ["PrevDay", "PrevDay2", "PrevLastHr", "DelivPct", "DelivPctPrev",
-            "Open"]
+            "Open", "dTC", "dBC", "wTC", "wBC"]
 
 
 def _now():
@@ -124,7 +127,7 @@ def cash_data(symbols, d1=None):
         except Exception:
             m5 = None
         for x in b:
-            rec = {"today": 0.0, "lasthr": 0.0, "open": 0.0}
+            rec = {"today": 0.0, "lasthr": 0.0, "open": 0.0, "vwap": 0.0}
             # Today's running total: the daily bar is the exchange's own figure
             # and is more complete than summing 5-minute bars (RVNL: 1,901,031
             # vs 1,791,416). Match it by date, never by position.
@@ -164,6 +167,18 @@ def cash_data(symbols, d1=None):
                     # did not happen, so Open stays BLANK until the daily bar
                     # arrives -- GAP% and OPEN% are then simply absent for the
                     # first snapshot or two rather than quietly wrong.
+                    # Session VWAP: sum(typical price x volume) / sum(volume)
+                    # over today's bars, typical = (H+L+C)/3. Anchored at the
+                    # open and cumulative, so it is the day's true average
+                    # traded price, not an average of prices.
+                    td = s[s.d == today]
+                    if not td.empty and {"High", "Low", "Close", "Volume"} <= set(td.columns):
+                        tp = (td["High"].astype(float) + td["Low"].astype(float)
+                              + td["Close"].astype(float)) / 3.0
+                        vol = td["Volume"].astype(float).fillna(0)
+                        tot = float(vol.sum())
+                        if tot > 0:
+                            rec["vwap"] = float((tp * vol).sum() / tot)
                     if d1:
                         yd = s[s.d == d1]
                         if not yd.empty:
@@ -177,11 +192,15 @@ def cash_data(symbols, d1=None):
 
 
 # ------------------------------------------------------------- delivery -----
-def nse_cash_prev():
-    """The last two COMPLETED cash sessions, straight from NSE's bhavcopy --
-    the authoritative source for both volume and delivery, with no missing
+def nse_cash_prev(days=2):
+    """The last COMPLETED cash sessions, straight from NSE's bhavcopy -- the
+    authoritative source for volume, delivery and OHLC, with no missing
     sessions. Returns (sessions, dates), newest first, each session
-    {sym: {"vol": shares, "deliv": delivery %}}."""
+    {sym: {"vol", "deliv", "close", "high", "low"}}.
+
+    `days` is normally 2; pivot_range() asks for more, but only on the first
+    snapshot of a day, since a bhavcopy costs ~390 KB and the pivots it feeds
+    do not change once computed."""
     from curl_cffi import requests as cffi
     s = cffi.Session(impersonate="chrome")
 
@@ -209,7 +228,13 @@ def nse_cash_prev():
                     cl = float(k.get("CLOSE_PRICE", 0) or 0)
                 except Exception:
                     cl = 0.0
-                out[k["SYMBOL"].strip()] = {"vol": vol, "deliv": dp, "close": cl}
+                try:
+                    hi = float(k.get("HIGH_PRICE", 0) or 0)
+                    lo = float(k.get("LOW_PRICE", 0) or 0)
+                except Exception:
+                    hi = lo = 0.0
+                out[k["SYMBOL"].strip()] = {"vol": vol, "deliv": dp, "close": cl,
+                                            "high": hi, "low": lo}
             return out
         except Exception:
             return {}
@@ -223,9 +248,69 @@ def nse_cash_prev():
         if r:
             got.append(r)
             dates.append(d.strftime("%Y-%m-%d"))
-        if len(got) == 2:
+        if len(got) >= days:
             break
     return got, dates
+
+
+def pivot_range(sessions, dates):
+    """Central Pivot Range, daily and weekly.
+
+        P  = (H + L + C) / 3          the pivot
+        BC = (H + L) / 2              bottom central
+        TC = 2P - BC                  top central, mirrored about P
+
+    TC is not always the larger of the two -- when BC sits above P the pair
+    inverts -- so they are returned ordered by value, not by name. The width
+    |TC - BC| is the useful part: a narrow range implies a trending day, a
+    wide one a rangebound day.
+
+    Daily uses the previous session. Weekly uses the previous CALENDAR week --
+    highest high, lowest low, and the close of that week's final session.
+    Returns {sym: {"dTC","dBC","wTC","wBC"}}."""
+    if not sessions or not dates:
+        return {}
+
+    def cpr(h, l, c):
+        if h <= 0 or l <= 0 or c <= 0:
+            return None
+        p  = (h + l + c) / 3.0
+        bc = (h + l) / 2.0
+        tc = 2.0 * p - bc
+        return (max(tc, bc), min(tc, bc))
+
+    out = {}
+    for sym, r in sessions[0].items():
+        v = cpr(r.get("high", 0), r.get("low", 0), r.get("close", 0))
+        if v:
+            out.setdefault(sym, {})["dTC"], out[sym]["dBC"] = round(v[0], 2), round(v[1], 2)
+
+    # Sessions belonging to the calendar week before the most recent session's.
+    ref_week = datetime.strptime(dates[0], "%Y-%m-%d").isocalendar()[:2]
+    prev = [(dt_, s) for dt_, s in zip(dates, sessions)
+            if datetime.strptime(dt_, "%Y-%m-%d").isocalendar()[:2] < ref_week]
+    if not prev:
+        return out
+    target = datetime.strptime(prev[0][0], "%Y-%m-%d").isocalendar()[:2]
+    week = [s for dt_, s in prev
+            if datetime.strptime(dt_, "%Y-%m-%d").isocalendar()[:2] == target]
+    if not week:
+        return out
+
+    syms = set()
+    for s in week:
+        syms |= set(s)
+    for sym in syms:
+        highs = [s[sym]["high"] for s in week if sym in s and s[sym]["high"] > 0]
+        lows  = [s[sym]["low"]  for s in week if sym in s and s[sym]["low"]  > 0]
+        # `week` is newest-first, so the LAST entry is that week's final session
+        closes = [s[sym]["close"] for s in week if sym in s and s[sym]["close"] > 0]
+        if not (highs and lows and closes):
+            continue
+        v = cpr(max(highs), min(lows), closes[0])
+        if v:
+            out.setdefault(sym, {})["wTC"], out[sym]["wBC"] = round(v[0], 2), round(v[1], 2)
+    return out
 
 
 # -------------------------------------------------------------- options -----
@@ -529,9 +614,22 @@ def main():
     syms = universe()
     print(f"universe {len(syms)}")
 
-    cashp, cdates = nse_cash_prev()
+    df = load_or_init(day, syms)
+    key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
+
+    # Pivots are fixed for the day and the week, and reaching back far enough
+    # for the previous week costs ~8 bhavcopies. Do it only when they are not
+    # already recorded -- in practice, the first snapshot of the day.
+    have_piv = ("wTC" in df.columns and
+                pd.to_numeric(df.loc[df.Metric == "PRICE", "wTC"],
+                              errors="coerce").notna().any())
+    cashp, cdates = nse_cash_prev(days=2 if have_piv else 8)
     print(f"  cash bhavcopy {', '.join(cdates) or 'none'}")
     d1 = cdates[0] if cdates else None
+
+    piv = {} if have_piv else pivot_range(cashp, cdates)
+    if piv:
+        print(f"  pivots computed for {len(piv)} symbols")
 
     cash = cash_data(syms, d1);        print(f"  cash    {len(cash)}")
     fut  = fetch_oi_spurts();          print(f"  futures {len(fut)}")
@@ -542,9 +640,6 @@ def main():
     p2 = cashp[1] if len(cashp) > 1 else {}
     f1 = fo[0]    if len(fo)    > 0 else {}
     f2 = fo[1]    if len(fo)    > 1 else {}
-
-    df = load_or_init(day, syms)
-    key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
 
     def put(sym, metric, value):
         i = key.get((sym, metric))
@@ -589,6 +684,10 @@ def main():
             # keeps it tracking the source if the bar is later revised.
             if c.get("open", 0) > 0:
                 ref(s, "PRICE", "Open", round(c["open"], 2), force=True)
+            if c.get("vwap", 0) > 0:
+                put(s, "VWAP", round(c["vwap"], 2))
+        for k_, v_ in (piv.get(s) or {}).items():
+            ref(s, "PRICE", k_, v_)
         if s in p1:
             ref(s, "CASH VOL", "PrevDay",      int(p1[s]["vol"]))
             ref(s, "CASH VOL", "DelivPct",     p1[s]["deliv"])
