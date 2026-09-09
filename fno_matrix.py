@@ -79,7 +79,8 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # way price is going, so a buildup cannot be read without it.
 METRICS  = ["PRICE", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI"]
-REF      = ["PrevDay", "PrevDay2", "PrevLastHr", "DelivPct", "DelivPctPrev"]
+REF      = ["PrevDay", "PrevDay2", "PrevLastHr", "DelivPct", "DelivPctPrev",
+            "Open"]
 
 
 def _now():
@@ -123,7 +124,7 @@ def cash_data(symbols, d1=None):
         except Exception:
             m5 = None
         for x in b:
-            rec = {"today": 0.0, "lasthr": 0.0}
+            rec = {"today": 0.0, "lasthr": 0.0, "open": 0.0}
             # Today's running total: the daily bar is the exchange's own figure
             # and is more complete than summing 5-minute bars (RVNL: 1,901,031
             # vs 1,791,416). Match it by date, never by position.
@@ -134,6 +135,12 @@ def cash_data(symbols, d1=None):
                     for ts, row in d.iterrows():
                         if str(ts)[:10] == today:
                             rec["today"] = float(row["Volume"])
+                            # Today's OPEN separates a gap from the session's
+                            # own move. COFORGE on 2026-09-09 gapped -6.6% and
+                            # then rose +2.3% off that open: against yesterday's
+                            # close it reads -4.5% and looks like a stock going
+                            # down, which is the opposite of what it was doing.
+                            rec["open"] = float(row.get("Open", 0) or 0)
                             break
             except Exception:
                 pass
@@ -468,7 +475,13 @@ def load_or_init(day, symbols):
         # AND ratio values in its time cells. Appending absolutes to it would
         # leave one row holding both, which is worse than losing the morning:
         # start the day again rather than mix the two.
-        if set(REF).issubset(d.columns):
+        # "PrevDay" marks the absolute-era format. Testing for the FULL set of
+        # REF columns would mean that merely adding one (Open) looked like the
+        # old ratio format and threw the day away.
+        if "PrevDay" in d.columns:
+            for c in REF:
+                if c not in d.columns:
+                    d[c] = ""
             # A metric added since the file was created (PRICE) is appended
             # rather than triggering a rebuild, so the day's snapshots survive.
             have = set(zip(d["Symbol"], d["Metric"]))
@@ -562,6 +575,8 @@ def main():
                 put(s, "CASH VOL", int(c["today"]))
             if c["lasthr"] > 0:
                 ref(s, "CASH VOL", "PrevLastHr", int(c["lasthr"]))
+            if c.get("open", 0) > 0:
+                ref(s, "PRICE", "Open", round(c["open"], 2))
         if s in p1:
             ref(s, "CASH VOL", "PrevDay",      int(p1[s]["vol"]))
             ref(s, "CASH VOL", "DelivPct",     p1[s]["deliv"])

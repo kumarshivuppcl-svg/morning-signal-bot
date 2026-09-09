@@ -66,9 +66,12 @@ def build(day=None, top_n=TOP_N):
         return None
     now = tcols[-1]
 
+    first = tcols[0]
     g = lambda m, c: _series(df, m, c)
     T = pd.DataFrame({
         "price":  g("PRICE",    now),   "pc1": g("PRICE",    "PrevDay"),
+        "open":   g("PRICE",    "Open"),
+        "oi0":    g("F&O OI",   first),
         "cash":   g("CASH VOL", now),
         "cp1":    g("CASH VOL", "PrevDay"), "cp2": g("CASH VOL", "PrevDay2"),
         "oi":     g("F&O OI",   now),
@@ -103,20 +106,39 @@ def build(day=None, top_n=TOP_N):
 
     T["PCR"] = (T.poi / T.coi).where(T.coi > 0)
     T["LEV"] = (T.OPT / T.VOL).where(T.VOL > 0)
-    T["CHG"] = ((T.price / T.pc1 - 1) * 100).where(T.pc1 > 0)
     T["DLV"] = T.dlv - T.dlv2
 
-    def build_state(r):
-        if pd.isna(r.CHG) or pd.isna(r.OIC):
+    # Three price frames, because one number cannot separate a gap from the
+    # session. COFORGE on 2026-09-09: GAP -6.6, OPN +2.3, CHG -4.5 -- down on
+    # the day, up since the open, and only the pair says so.
+    T["CHG"] = ((T.price / T.pc1  - 1) * 100).where(T.pc1  > 0)
+    T["OPN"] = ((T.price / T.open - 1) * 100).where(T.open > 0)
+    T["GAP"] = ((T.open  / T.pc1  - 1) * 100).where((T.pc1 > 0) & (T.open > 0))
+
+    def state(chg, oi_up):
+        if pd.isna(chg) or oi_up is None:
             return ""
-        up, oi = r.CHG > 0, r.OIC > 1.005
-        return ("LONG BUILD"  if up and oi else
+        up = chg > 0
+        return ("LONG BUILD"  if up and oi_up else
                 "SHORT COVER" if up else
-                "SHORT BUILD" if oi else "LONG UNWIND")
-    T["BUILD"] = T.apply(build_state, axis=1)
+                "SHORT BUILD" if oi_up else "LONG UNWIND")
+
+    # BUILD reads the whole day: OI now against the prior session's close.
+    T["BUILD"] = [state(c, (o > 1.005) if pd.notna(o) else None)
+                  for c, o in zip(T.CHG, T.OIC)]
+
+    # SESS reads the session alone: price against today's open, OI against the
+    # day's FIRST snapshot. It answers the question BUILD cannot -- whether
+    # positions are still being added into the move you are watching now, or
+    # whether the build happened earlier and the move is just a bounce.
+    sess_oi = (T.oi / T.oi0).where(T.oi0 > 0)
+    T["SOI"] = sess_oi
+    T["SESS"] = [state(c, (o > 1.002) if pd.notna(o) else None)
+                 for c, o in zip(T.OPN, sess_oi)]
 
     out = T.sort_values("SCORE", ascending=False).head(top_n)
-    cols = ["SCORE", "VOL", "OPT", "OIC", "CHG", "PCR", "LEV", "DLV", "BUILD"]
+    cols = ["SCORE", "VOL", "OPT", "OIC", "GAP", "OPN", "CHG", "SOI",
+            "PCR", "LEV", "DLV", "BUILD", "SESS"]
     out = out[cols].round(3)
     out.insert(0, "Rank", range(1, len(out) + 1))
     out.index.name = "Symbol"
@@ -134,10 +156,12 @@ if __name__ == "__main__":
         out, now, day = r
         print()
         print(f"{'#':<3}{'SYM':<12}{'SCORE':>6}{'VOL':>6}{'OPT':>7}{'OIC':>7}"
-              f"{'CHG%':>7}{'PCR':>6}{'LEV':>6}{'DLV%':>7}  BUILD")
+              f"{'GAP%':>7}{'OPEN%':>7}{'CHG%':>7}{'sOI':>6}{'PCR':>6}"
+              f"{'LEV':>6}  {'BUILD (day)':<12} SESSION")
         for s, x in out.iterrows():
             f = lambda v, w, p=2: (f"{v:>{w}.{p}f}" if pd.notna(v)
                                    else " " * (w - 1) + "-")
             print(f"{int(x.Rank):<3}{s:<12}{f(x.SCORE,6,3)}{f(x.VOL,6)}"
-                  f"{f(x.OPT,7)}{f(x.OIC,7,3)}{f(x.CHG,7)}{f(x.PCR,6)}"
-                  f"{f(x.LEV,6)}{f(x.DLV,7,1)}  {x.BUILD}")
+                  f"{f(x.OPT,7)}{f(x.OIC,7,3)}{f(x.GAP,7)}{f(x.OPN,7)}"
+                  f"{f(x.CHG,7)}{f(x.SOI,6,3)}{f(x.PCR,6)}{f(x.LEV,6)}"
+                  f"  {str(x.BUILD):<12} {x.SESS}")

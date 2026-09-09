@@ -61,20 +61,23 @@ function renderTop_(day) {
   /* Locate columns by NAME so a change in rank_top.py's column order cannot
      silently shift the values under the headings. */
   const h = {}; rows[0].forEach(function (n, i) { h[String(n).trim()] = i; });
-  const need = ['Symbol', 'Rank', 'SCORE', 'VOL', 'OPT', 'OIC', 'CHG', 'PCR', 'LEV', 'DLV', 'BUILD'];
+  const need = ['Symbol', 'Rank', 'SCORE', 'VOL', 'OPT', 'OIC', 'GAP', 'OPN',
+                'CHG', 'SOI', 'PCR', 'LEV', 'DLV', 'BUILD', 'SESS'];
   for (let i = 0; i < need.length; i++) {
     if (h[need[i]] === undefined) { console.log('ranking missing column ' + need[i]); return false; }
   }
 
-  const HEAD = ['#', 'SYMBOL', 'SCORE', 'VOL x', 'OPT x', 'OI x', 'CHG %',
-                'PCR', 'LEV', 'DELIV Δ', 'BUILD'];
+  const HEAD = ['#', 'SYMBOL', 'SCORE', 'VOL x', 'OPT x', 'OI x', 'GAP %',
+                'OPEN %', 'CHG %', 'sOI', 'PCR', 'LEV', 'DELIV Δ',
+                'BUILD (day)', 'SESSION'];
   const out = [HEAD];
   const num = function (v) { const x = parseFloat(v); return isNaN(x) ? '' : x; };
   for (let i = 1; i < rows.length; i++) {
     const s = rows[i];
     out.push([num(s[h.Rank]), s[h.Symbol], num(s[h.SCORE]), num(s[h.VOL]),
-              num(s[h.OPT]), num(s[h.OIC]), num(s[h.CHG]), num(s[h.PCR]),
-              num(s[h.LEV]), num(s[h.DLV]), s[h.BUILD]]);
+              num(s[h.OPT]), num(s[h.OIC]), num(s[h.GAP]), num(s[h.OPN]),
+              num(s[h.CHG]), num(s[h.SOI]), num(s[h.PCR]), num(s[h.LEV]),
+              num(s[h.DLV]), s[h.BUILD], s[h.SESS]]);
   }
 
   const ss = book_();
@@ -92,6 +95,10 @@ function renderTop_(day) {
   sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day +
       '     ranked on 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline')
     .setFontWeight('bold').setFontSize(11);
+  sh.getRange(2, 1).setValue('GAP% = open vs prev close   OPEN% = now vs '
+      + 'today\'s open   CHG% = now vs prev close      BUILD reads the whole '
+      + 'day, SESSION reads since the open - bold where they disagree')
+    .setFontSize(9).setFontColor('#5F6368');
 
   const n = out.length, w = HEAD.length;
   const rng = sh.getRange(3, 1, n, w);
@@ -100,34 +107,53 @@ function renderTop_(day) {
   sh.getRange(3, 1, 1, w).setFontWeight('bold')
     .setBackground('#1F3864').setFontColor('#FFFFFF');
 
-  sh.getRange(4, 3, n - 1, 1).setNumberFormat('0.000');
-  sh.getRange(4, 4, n - 1, 5).setNumberFormat('0.00');
-  sh.getRange(4, 9, n - 1, 2).setNumberFormat('0.0');
+  sh.getRange(4, 3, n - 1, 1).setNumberFormat('0.000');   /* SCORE */
+  sh.getRange(4, 4, n - 1, 6).setNumberFormat('0.00');    /* VOL..OPEN% */
+  sh.getRange(4, 9, n - 1, 1).setNumberFormat('0.00');    /* CHG% */
+  sh.getRange(4, 10, n - 1, 1).setNumberFormat('0.000');  /* sOI */
+  sh.getRange(4, 11, n - 1, 2).setNumberFormat('0.00');   /* PCR, LEV */
+  sh.getRange(4, 13, n - 1, 1).setNumberFormat('0.0');    /* DELIV */
   sh.getRange(4, 2, n - 1, 1).setFontWeight('bold');
+
+  const stateColor = function (b) {
+    return b === 'LONG BUILD'  ? '#137333' : b === 'SHORT BUILD' ? '#B3261E' :
+           b === 'SHORT COVER' ? '#1A73E8' : '#B06000';
+  };
 
   for (let i = 1; i < n; i++) {
     const row = out[i], at = 3 + i;
-    const chg = row[6];
-    if (chg !== '') {
-      sh.getRange(at, 7).setFontColor(chg > 0 ? '#137333' : chg < 0 ? '#B3261E' : '#111111');
-    }
+    /* GAP, OPEN and CHG each green or red by sign: the three together say
+       whether a move is the gap, the session, or both. */
+    [6, 7, 8].forEach(function (k) {
+      if (row[k] !== '') {
+        sh.getRange(at, k + 1).setFontColor(
+          row[k] > 0 ? '#137333' : row[k] < 0 ? '#B3261E' : '#111111');
+      }
+    });
     /* Options far hotter than cash = positioning is happening in the
        derivatives; a low value on a big VOL is block or index flow. */
-    if (row[8] !== '' && row[8] >= 2) sh.getRange(at, 9).setFontWeight('bold');
     if (row[3] !== '' && row[3] >= 2) sh.getRange(at, 4).setFontWeight('bold');
     if (row[4] !== '' && row[4] >= 2) sh.getRange(at, 5).setFontWeight('bold');
-    const b = String(row[10]);
-    sh.getRange(at, 11).setFontColor(
-      b === 'LONG BUILD'  ? '#137333' : b === 'SHORT BUILD' ? '#B3261E' :
-      b === 'SHORT COVER' ? '#1A73E8' : '#B06000');
+    if (row[11] !== '' && row[11] >= 2) sh.getRange(at, 12).setFontWeight('bold');
+
+    const bDay = String(row[13]), bSess = String(row[14]);
+    sh.getRange(at, 14).setFontColor(stateColor(bDay));
+    sh.getRange(at, 15).setFontColor(stateColor(bSess));
+    /* The two frames disagreeing IS the signal - the day was built one way
+       and the session is going the other. Bold it so it cannot be missed. */
+    if (bDay && bSess && bDay !== bSess) {
+      sh.getRange(at, 14, 1, 2).setFontWeight('bold');
+    }
     if (i % 2 === 0) sh.getRange(at, 1, 1, w).setBackground('#F1F3F4');
   }
 
   sh.setFrozenRows(3);
+  sh.setFrozenColumns(2);
   sh.setColumnWidth(1, 34);
-  sh.setColumnWidth(2, 108);
-  for (let c = 3; c <= 10; c++) sh.setColumnWidth(c, 62);
-  sh.setColumnWidth(11, 108);
+  sh.setColumnWidth(2, 106);
+  for (let c = 3; c <= 13; c++) sh.setColumnWidth(c, 58);
+  sh.setColumnWidth(14, 104);
+  sh.setColumnWidth(15, 104);
   console.log('TOP 15 rendered for ' + day);
   return true;
 }
