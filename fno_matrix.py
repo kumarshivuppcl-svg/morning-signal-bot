@@ -322,6 +322,7 @@ def prev_fno_volumes(days=1):
             return None
 
         ce, pe, spot, tv, toi, lot = {}, {}, {}, {}, {}, {}
+        ceo, peo = {}, {}          # per-contract OI, shares -> contracts below
         for x in rows:
             tp = (x.get("FinInstrmTp") or "").strip()
             if tp not in ("STF", "STO"):
@@ -347,18 +348,27 @@ def prev_fno_volumes(days=1):
                 continue
             if u > 0:
                 spot.setdefault(sym, u)
-            ot  = (x.get("OptnTp") or "").strip()
-            tgt = ce if ot == "CE" else pe if ot == "PE" else None
-            if tgt is None:
+            ot = (x.get("OptnTp") or "").strip()
+            if ot == "CE":
+                tgt, tgo = ce, ceo
+            elif ot == "PE":
+                tgt, tgo = pe, peo
+            else:
                 continue
-            m  = tgt.setdefault(sym, {})
             kk = (x.get("XpryDt", ""), k)
+            m  = tgt.setdefault(sym, {})
             m[kk] = m.get(kk, 0.0) + vol
+            n  = tgo.setdefault(sym, {})
+            n[kk] = n.get(kk, 0.0) + oi
 
         out = {}
         for sym in set(list(tv) + list(ce) + list(pe)):
             L = lot.get(sym, 0) or 1
+            # Bhavcopy OI is in SHARES while the option chain reports CONTRACTS,
+            # so divide here to keep both sides of the ratio in one unit.
             out[sym] = {"ce": ce.get(sym, {}), "pe": pe.get(sym, {}),
+                        "ceoi": {k: v / L for k, v in ceo.get(sym, {}).items()},
+                        "peoi": {k: v / L for k, v in peo.get(sym, {}).items()},
                         "spot": spot.get(sym, 0.0),
                         "tot_vol": tv.get(sym, 0.0),
                         "tot_oi":  toi.get(sym, 0.0) / L}
@@ -386,8 +396,8 @@ THIN = 0.25   # contract-matched base below this share of the moneyness-matched
               # territory; dividing by it produces a huge, meaningless ratio.
 
 
-def _band_totals(pf, expiry, strikes):
-    cem, pem = pf.get("ce", {}), pf.get("pe", {})
+def _band_totals(pf, expiry, strikes, ck="ce", pk="pe"):
+    cem, pem = pf.get(ck, {}), pf.get(pk, {})
     cv = pv = 0.0
     seen = 0
     for k in strikes:
@@ -399,10 +409,11 @@ def _band_totals(pf, expiry, strikes):
     return cv, pv, (seen / len(strikes) if strikes else 0.0)
 
 
-def prev_opt_vol(pf, expiry, strikes):
-    """Yesterday's CE/PE volume for the SAME expiry and the SAME strikes we
-    measured today, so a stock that has moved is not compared against a
-    different price band.
+def prev_opt_vol(pf, expiry, strikes, ck="ce", pk="pe"):
+    """A prior session's CE/PE figure for the SAME expiry and the SAME strikes
+    we measured today, so a stock that has moved is not compared against a
+    different price band. ck/pk select the quantity: "ce"/"pe" for volume,
+    "ceoi"/"peoi" for open interest.
 
     Guard: when those exact contracts were nearly dormant yesterday (a big
     mover's new band sat far OTM), the contract-matched base collapses toward
@@ -414,16 +425,16 @@ def prev_opt_vol(pf, expiry, strikes):
     the strict contract-matched base was used."""
     if not pf or not expiry or not strikes:
         return 0.0, 0.0, 0.0, False
-    cv, pv, cover = _band_totals(pf, expiry, strikes)
+    cv, pv, cover = _band_totals(pf, expiry, strikes, ck, pk)
 
-    ks = sorted({k for (e, k) in pf.get("ce", {}) if e == expiry} |
-                {k for (e, k) in pf.get("pe", {}) if e == expiry})
+    ks = sorted({k for (e, k) in pf.get(ck, {}) if e == expiry} |
+                {k for (e, k) in pf.get(pk, {}) if e == expiry})
     yspot = pf.get("spot", 0.0)
     if not ks or yspot <= 0:
         return cv, pv, cover, True
     a = min(range(len(ks)), key=lambda i: abs(ks[i] - yspot))
     yband = ks[max(0, a - STRIKES): a + STRIKES + 1]
-    ycv, ypv, _ = _band_totals(pf, expiry, yband)
+    ycv, ypv, _ = _band_totals(pf, expiry, yband, ck, pk)
 
     if (ycv > 0 and cv < THIN * ycv) or (ypv > 0 and pv < THIN * ypv):
         return ycv, ypv, cover, False
@@ -557,12 +568,25 @@ def main():
                 ref(s, "PUT OI",  "PrevDay", o["put_prev_oi"])
             # Same expiry, same strikes on both sides, so a stock that has
             # moved is not compared against a different price band.
-            b_cv, b_pv, cover, _exact = prev_opt_vol(f1.get(s), o.get("expiry"),
-                                                     o.get("strikes"))
+            xp, ks_ = o.get("expiry"), o.get("strikes")
+            b_cv, b_pv, cover, _x = prev_opt_vol(f1.get(s), xp, ks_)
             if b_cv > 0 and cover >= 0.6:
                 ref(s, "CALL VOL", "PrevDay", int(b_cv))
             if b_pv > 0 and cover >= 0.6:
                 ref(s, "PUT VOL",  "PrevDay", int(b_pv))
+
+            # Session before last, same expiry and strikes. The band is two
+            # sessions stale here, so the dormant-band fallback matters more.
+            c2, p2_, cov2, _x = prev_opt_vol(f2.get(s), xp, ks_)
+            if c2 > 0 and cov2 >= 0.6:
+                ref(s, "CALL VOL", "PrevDay2", int(c2))
+            if p2_ > 0 and cov2 >= 0.6:
+                ref(s, "PUT VOL",  "PrevDay2", int(p2_))
+            co2, po2, cov3, _x = prev_opt_vol(f2.get(s), xp, ks_, "ceoi", "peoi")
+            if co2 > 0 and cov3 >= 0.6:
+                ref(s, "CALL OI", "PrevDay2", int(co2))
+            if po2 > 0 and cov3 >= 0.6:
+                ref(s, "PUT OI",  "PrevDay2", int(po2))
 
     df = df[["Symbol", "Metric"] + REF +
             [c for c in df.columns if ":" in str(c)]]
