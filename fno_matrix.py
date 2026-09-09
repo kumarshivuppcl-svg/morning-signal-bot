@@ -135,13 +135,11 @@ def cash_data(symbols, d1=None):
                     for ts, row in d.iterrows():
                         if str(ts)[:10] == today:
                             rec["today"] = float(row["Volume"])
-                            # PREFERRED source. Checked against NSE's own
-                            # bhavcopy for 2026-09-09: the daily bar's Open
-                            # matched OPEN_PRICE exactly on every symbol, while
-                            # the first 5-minute bar did not -- it starts at the
-                            # continuous session and misses the 09:00-09:15
-                            # pre-open auction that actually sets the open
-                            # (COFORGE 1821.00 vs the true 1815.50).
+                            # The ONLY source for Open. Checked against NSE's
+                            # own bhavcopy for 2026-09-09: the daily bar's Open
+                            # matched OPEN_PRICE exactly on all 208 F&O names.
+                            # See the note below on why nothing stands in for
+                            # it while it is still absent.
                             rec["open"] = float(row.get("Open", 0) or 0)
                             break
             except Exception:
@@ -157,18 +155,15 @@ def cash_data(symbols, d1=None):
                     s = s.dropna(subset=["Close"]).sort_values("dt")
                     if rec["today"] <= 0:
                         rec["today"] = float(s[s.d == today]["Volume"].fillna(0).sum())
-                    # STOPGAP only, when the daily bar has not arrived yet: the
-                    # first 5-minute bar exists from the very first snapshot,
-                    # so GAP%/OPEN% show something at 09:20 instead of blanks.
-                    # It is off by up to ~0.6% (it misses the pre-open
-                    # auction), so main() rewrites Open on every snapshot and
-                    # the value upgrades itself the moment the daily bar lands.
-                    if rec["open"] <= 0:
-                        td = s[s.d == today]
-                        if not td.empty and "Open" in td.columns:
-                            o = float(td.iloc[0]["Open"] or 0)
-                            if o > 0:
-                                rec["open"] = o
+                    # No fallback for Open. The first 5-minute bar starts at the
+                    # continuous session and misses the 09:00-09:15 pre-open
+                    # auction that sets the opening price: across all 208 F&O
+                    # names on 2026-09-09 it matched NSE's OPEN_PRICE on only
+                    # 22, median error 0.13% and worst 1.2% (TECHM 1512.40
+                    # against a true 1531.00). A wrong GAP% reads as a gap that
+                    # did not happen, so Open stays BLANK until the daily bar
+                    # arrives -- GAP% and OPEN% are then simply absent for the
+                    # first snapshot or two rather than quietly wrong.
                     if d1:
                         yd = s[s.d == d1]
                         if not yd.empty:
@@ -589,9 +584,10 @@ def main():
                 put(s, "CASH VOL", int(c["today"]))
             if c["lasthr"] > 0:
                 ref(s, "CASH VOL", "PrevLastHr", int(c["lasthr"]))
+            # Only ever written from the daily bar, so the cell stays blank
+            # until that exists rather than holding an approximation. force
+            # keeps it tracking the source if the bar is later revised.
             if c.get("open", 0) > 0:
-                # force=True so an early snapshot's 5-minute stopgap is
-                # replaced by the true opening price once the daily bar lands.
                 ref(s, "PRICE", "Open", round(c["open"], 2), force=True)
         if s in p1:
             ref(s, "CASH VOL", "PrevDay",      int(p1[s]["vol"]))
