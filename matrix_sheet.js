@@ -38,12 +38,92 @@ const BLOCK = 8;   /* rows per stock - keep in step with METRICS */
 function refreshNow() {
   collect_();
   const day = istToday();
+  /* Ranked list first: it is the tab you actually read, and it must not be
+     skipped if the much larger matrix render fails or times out. */
+  renderTop_(day);
   const res = fetchCsv_(day);
   if (res) { render_(res, day, 'MATRIX'); return; }
   /* No snapshot for today yet (before 9:20, or a holiday). Wipe any leftover
      data from a previous day so yesterday's numbers are never mistaken for
      today's — reference columns are rebuilt on the first real snapshot. */
   clearStale_(day);
+}
+
+/* Draw the composite top 15 on the FIRST tab, so it is what opens.
+   Returns false when no ranking exists for `day` yet. */
+function renderTop_(day) {
+  const r = UrlFetchApp.fetch(RAW + 'top15_' + day + '.csv?cb=' + Date.now(),
+                              { muteHttpExceptions: true });
+  if (r.getResponseCode() !== 200) { console.log('no ranking for ' + day); return false; }
+  const rows = Utilities.parseCsv(r.getContentText());
+  if (!rows || rows.length < 2) return false;
+
+  /* Locate columns by NAME so a change in rank_top.py's column order cannot
+     silently shift the values under the headings. */
+  const h = {}; rows[0].forEach(function (n, i) { h[String(n).trim()] = i; });
+  const need = ['Symbol', 'Rank', 'SCORE', 'VOL', 'OPT', 'OIC', 'CHG', 'PCR', 'LEV', 'DLV', 'BUILD'];
+  for (let i = 0; i < need.length; i++) {
+    if (h[need[i]] === undefined) { console.log('ranking missing column ' + need[i]); return false; }
+  }
+
+  const HEAD = ['#', 'SYMBOL', 'SCORE', 'VOL x', 'OPT x', 'OI x', 'CHG %',
+                'PCR', 'LEV', 'DELIV Δ', 'BUILD'];
+  const out = [HEAD];
+  const num = function (v) { const x = parseFloat(v); return isNaN(x) ? '' : x; };
+  for (let i = 1; i < rows.length; i++) {
+    const s = rows[i];
+    out.push([num(s[h.Rank]), s[h.Symbol], num(s[h.SCORE]), num(s[h.VOL]),
+              num(s[h.OPT]), num(s[h.OIC]), num(s[h.CHG]), num(s[h.PCR]),
+              num(s[h.LEV]), num(s[h.DLV]), s[h.BUILD]]);
+  }
+
+  const ss = book_();
+  let sh = ss.getSheetByName('TOP 15');
+  if (!sh) sh = ss.insertSheet('TOP 15', 0);
+  ss.setActiveSheet(sh); ss.moveActiveSheet(1);
+  sh.clear();
+
+  sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day +
+      '     ranked on 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline')
+    .setFontWeight('bold').setFontSize(11);
+
+  const n = out.length, w = HEAD.length;
+  const rng = sh.getRange(3, 1, n, w);
+  rng.setValues(out);
+  rng.setFontFamily('Roboto Mono').setFontSize(10);
+  sh.getRange(3, 1, 1, w).setFontWeight('bold')
+    .setBackground('#1F3864').setFontColor('#FFFFFF');
+
+  sh.getRange(4, 3, n - 1, 1).setNumberFormat('0.000');
+  sh.getRange(4, 4, n - 1, 5).setNumberFormat('0.00');
+  sh.getRange(4, 9, n - 1, 2).setNumberFormat('0.0');
+  sh.getRange(4, 2, n - 1, 1).setFontWeight('bold');
+
+  for (let i = 1; i < n; i++) {
+    const row = out[i], at = 3 + i;
+    const chg = row[6];
+    if (chg !== '') {
+      sh.getRange(at, 7).setFontColor(chg > 0 ? '#137333' : chg < 0 ? '#B3261E' : '#111111');
+    }
+    /* Options far hotter than cash = positioning is happening in the
+       derivatives; a low value on a big VOL is block or index flow. */
+    if (row[8] !== '' && row[8] >= 2) sh.getRange(at, 9).setFontWeight('bold');
+    if (row[3] !== '' && row[3] >= 2) sh.getRange(at, 4).setFontWeight('bold');
+    if (row[4] !== '' && row[4] >= 2) sh.getRange(at, 5).setFontWeight('bold');
+    const b = String(row[10]);
+    sh.getRange(at, 11).setFontColor(
+      b === 'LONG BUILD'  ? '#137333' : b === 'SHORT BUILD' ? '#B3261E' :
+      b === 'SHORT COVER' ? '#1A73E8' : '#B06000');
+    if (i % 2 === 0) sh.getRange(at, 1, 1, w).setBackground('#F1F3F4');
+  }
+
+  sh.setFrozenRows(3);
+  sh.setColumnWidth(1, 34);
+  sh.setColumnWidth(2, 108);
+  for (let c = 3; c <= 10; c++) sh.setColumnWidth(c, 62);
+  sh.setColumnWidth(11, 108);
+  console.log('TOP 15 rendered for ' + day);
+  return true;
 }
 
 /* Ask GitHub to run a snapshot now. Non-fatal: if the token is missing or
@@ -79,9 +159,13 @@ function istNow_() {
 /* Pull only, no collection - use when you just want to redraw the sheet. */
 function pullOnly() {
   const day = istToday();
+  renderTop_(day);
   const res = fetchCsv_(day);
   if (res) render_(res, day, 'MATRIX'); else clearStale_(day);
 }
+
+/* Draw only the ranked list - fastest way to see today's opportunities. */
+function topOnly() { renderTop_(istToday()); }
 
 function loadDay(d) {
   const res = fetchCsv_(d);
