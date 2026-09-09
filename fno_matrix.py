@@ -529,11 +529,21 @@ def main():
         if i is not None:
             df.at[i, col] = value
 
-    def ref(sym, metric, column, value):
-        """Reference columns are yesterday's figures -- fixed for the whole
-        day, so only ever written once."""
+    def ref(sym, metric, column, value, force=False):
+        """Reference columns hold prior-session figures.
+
+        Most are properties of a finished session -- closing price, full-day
+        volume, delivery -- so they are written once and left alone.
+
+        The four option rows are the exception and pass force=True. Their
+        baseline is summed over the ATM band measured in THIS snapshot, and
+        spot moves during the day. Writing it once would anchor the
+        denominator to whichever band happened to be current at the first
+        snapshot while the numerator kept following spot to new strikes --
+        reintroducing intraday the very band mismatch that was fixed
+        day-over-day. Recomputing keeps both sides on the same contracts."""
         i = key.get((sym, metric))
-        if i is not None and _blank(df.at[i, column]):
+        if i is not None and (force or _blank(df.at[i, column])):
             df.at[i, column] = value
 
     for c in REF:
@@ -590,30 +600,30 @@ def main():
             # Yesterday's OI comes free with the chain: openInterest minus
             # changeinOpenInterest. Verified exact against the bhavcopy.
             if o.get("call_prev_oi"):
-                ref(s, "CALL OI", "PrevDay", o["call_prev_oi"])
+                ref(s, "CALL OI", "PrevDay", o["call_prev_oi"], force=True)
             if o.get("put_prev_oi"):
-                ref(s, "PUT OI",  "PrevDay", o["put_prev_oi"])
+                ref(s, "PUT OI",  "PrevDay", o["put_prev_oi"], force=True)
             # Same expiry, same strikes on both sides, so a stock that has
             # moved is not compared against a different price band.
             xp, ks_ = o.get("expiry"), o.get("strikes")
             b_cv, b_pv, cover, _x = prev_opt_vol(f1.get(s), xp, ks_)
             if b_cv > 0 and cover >= 0.6:
-                ref(s, "CALL VOL", "PrevDay", int(b_cv))
+                ref(s, "CALL VOL", "PrevDay", int(b_cv), force=True)
             if b_pv > 0 and cover >= 0.6:
-                ref(s, "PUT VOL",  "PrevDay", int(b_pv))
+                ref(s, "PUT VOL",  "PrevDay", int(b_pv), force=True)
 
             # Session before last, same expiry and strikes. The band is two
             # sessions stale here, so the dormant-band fallback matters more.
             c2, p2_, cov2, _x = prev_opt_vol(f2.get(s), xp, ks_)
             if c2 > 0 and cov2 >= 0.6:
-                ref(s, "CALL VOL", "PrevDay2", int(c2))
+                ref(s, "CALL VOL", "PrevDay2", int(c2), force=True)
             if p2_ > 0 and cov2 >= 0.6:
-                ref(s, "PUT VOL",  "PrevDay2", int(p2_))
+                ref(s, "PUT VOL",  "PrevDay2", int(p2_), force=True)
             co2, po2, cov3, _x = prev_opt_vol(f2.get(s), xp, ks_, "ceoi", "peoi")
             if co2 > 0 and cov3 >= 0.6:
-                ref(s, "CALL OI", "PrevDay2", int(co2))
+                ref(s, "CALL OI", "PrevDay2", int(co2), force=True)
             if po2 > 0 and cov3 >= 0.6:
-                ref(s, "PUT OI",  "PrevDay2", int(po2))
+                ref(s, "PUT OI",  "PrevDay2", int(po2), force=True)
 
     df = df[["Symbol", "Metric"] + REF +
             [c for c in df.columns if ":" in str(c)]]
