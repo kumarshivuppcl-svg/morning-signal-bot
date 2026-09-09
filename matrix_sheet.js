@@ -78,9 +78,15 @@ function renderTop_(day) {
   }
 
   const ss = book_();
-  let sh = ss.getSheetByName('TOP 15');
-  if (!sh) sh = ss.insertSheet('TOP 15', 0);
-  ss.setActiveSheet(sh); ss.moveActiveSheet(1);
+  /* Write into Sheet1 - the tab that opens - rather than making you hunt for
+     a new one. Falls back to the first tab, and only creates a tab if the
+     book has neither. MATRIX is never overwritten. */
+  let sh = ss.getSheetByName('Sheet1');
+  if (!sh) {
+    const first = ss.getSheets()[0];
+    sh = (first && first.getName() !== 'MATRIX') ? first
+                                                 : ss.insertSheet('TOP 15', 0);
+  }
   sh.clear();
 
   sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day +
@@ -166,6 +172,38 @@ function pullOnly() {
 
 /* Draw only the ranked list - fastest way to see today's opportunities. */
 function topOnly() { renderTop_(istToday()); }
+
+/* Run this if the tab stays blank. It reports each step separately so the
+   failing one is obvious, instead of a silent no-op. */
+function testTop() {
+  const day = istToday();
+  console.log('1. IST date used: ' + day);
+
+  if (!SHEET_ID || SHEET_ID.indexOf('PASTE') === 0) {
+    console.log('2. STOP - SHEET_ID is still the placeholder. Copy your Sheet '
+              + 'ID from its URL, the part between /d/ and /edit');
+    return;
+  }
+  let ss;
+  try { ss = book_(); } catch (e) { console.log('2. STOP - ' + e.message); return; }
+  console.log('2. opened book: "' + ss.getName() + '"');
+  console.log('3. tabs present: '
+            + ss.getSheets().map(function (s) { return s.getName(); }).join(', '));
+
+  const url = RAW + 'top15_' + day + '.csv?cb=' + Date.now();
+  const r = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+  console.log('4. ranking file HTTP ' + r.getResponseCode() + '  ' + url);
+  if (r.getResponseCode() !== 200) {
+    console.log('   -> no ranking published for ' + day + ' yet. Before the '
+              + 'first snapshot (9:20 IST), on a holiday, or the date is off.');
+    return;
+  }
+  const rows = Utilities.parseCsv(r.getContentText());
+  console.log('5. parsed ' + rows.length + ' lines; header: ' + rows[0].join(','));
+  const ok = renderTop_(day);
+  console.log('6. render returned ' + ok
+            + (ok ? ' - look at the first tab' : ' - see the message above'));
+}
 
 function loadDay(d) {
   const res = fetchCsv_(d);
