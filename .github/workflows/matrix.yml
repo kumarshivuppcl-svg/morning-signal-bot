@@ -70,6 +70,12 @@ jobs:
             python fno_matrix.py
             python rank_top.py || true
 
+            # Scorecard once a day, near the close: it should capture the
+            # CLOSING ranking, and its forward-return fill costs a few
+            # bhavcopy fetches that would be wasted on every pass.
+            IST=$(TZ=Asia/Kolkata date +%H%M)
+            if [ "$((10#$IST))" -ge 1510 ]; then python scorecard.py || true; fi
+
             git add data/ 2>/dev/null
             if ! git diff --cached --quiet; then
               git commit -q -m "matrix $(date -u +%H:%M)"

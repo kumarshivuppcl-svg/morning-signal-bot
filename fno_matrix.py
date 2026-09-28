@@ -77,8 +77,14 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # figure NSE's oi-spurts feed reports. They are not futures-only.
 # PRICE leads each block: OI rising means opposite things depending on which
 # way price is going, so a buildup cannot be read without it.
+# CALL SPRD / PUT SPRD are the one exception to "cells hold absolutes": they
+# are the ATM quoted spread as a PERCENTAGE of mid. Both inputs come from the
+# same instant rather than a prior session, so nothing is hidden by the
+# division, and the percentage is the form the cost question is actually asked
+# in -- an edge either clears the spread or it does not.
 METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
-            "CALL VOL", "CALL OI", "PUT VOL", "PUT OI"]
+            "CALL VOL", "CALL OI", "PUT VOL", "PUT OI",
+            "CALL SPRD", "PUT SPRD"]
 # dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
 # on the PRICE row. They are fixed for the whole day (and week), so they are
 # fetched once and left alone -- see pivot_range().
@@ -382,12 +388,29 @@ def option_data(symbols):
                 # yesterday's OI = today's OI minus the change since yesterday
                 c_prev += _coi - int(float(ce.get("changeinOpenInterest", 0) or 0))
                 p_prev += _poi - int(float(pe.get("changeinOpenInterest", 0) or 0))
+            # Quoted spread at the ATM strike, as a percentage of mid. This is
+            # the cost hurdle any options signal has to clear: on a mid-cap
+            # name a round trip can eat several percent of premium, which is
+            # larger than most edges. Measuring it beats assuming it.
+            def _spread(leg):
+                b = float(leg.get("bidprice", 0) or 0)
+                a = float(leg.get("askPrice", 0) or 0)
+                mid = (a + b) / 2.0
+                if b <= 0 or a <= 0 or mid <= 0 or a < b:
+                    return ""          # no two-sided quote (closed, or illiquid)
+                return round((a - b) / mid * 100, 2)
+
+            atm_row = rows[atm]
+            c_sp = _spread(atm_row.get("CE") or {})
+            p_sp = _spread(atm_row.get("PE") or {})
+
             # `expiry` + `strikes` let the caller pull yesterday's volume for
             # EXACTLY these contracts, so both sides of the ratio cover the
             # same strike band even when the underlying has moved hard.
             return sym, {"call_vol": cv, "call_oi": co,
                          "put_vol": pv, "put_oi": po,
                          "call_prev_oi": c_prev, "put_prev_oi": p_prev,
+                         "call_sprd": c_sp, "put_sprd": p_sp,
                          "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
         except Exception:
             return sym, None
@@ -723,6 +746,10 @@ def main():
             put(s, "PUT VOL",  o["put_vol"])
             put(s, "CALL OI",  o["call_oi"])
             put(s, "PUT OI",   o["put_oi"])
+            if o.get("call_sprd") != "":
+                put(s, "CALL SPRD", o["call_sprd"])
+            if o.get("put_sprd") != "":
+                put(s, "PUT SPRD", o["put_sprd"])
             # Yesterday's OI comes free with the chain: openInterest minus
             # changeinOpenInterest. Verified exact against the bhavcopy.
             if o.get("call_prev_oi"):
