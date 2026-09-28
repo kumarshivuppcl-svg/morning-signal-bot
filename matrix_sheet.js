@@ -94,9 +94,34 @@ function renderTop_(day) {
   }
   sh.clear();
 
-  sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day +
-      '     ranked on 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline')
-    .setFontWeight('bold').setFontSize(11);
+  /* Snapshot time, read defensively: a ranking published before this column
+     existed simply shows no time rather than failing to render at all. */
+  const at = (h.AT !== undefined && rows.length > 1)
+               ? String(rows[1][h.AT] || '').trim() : '';
+  const nowIst = istNow_();
+  const drawn = ('0' + nowIst.getHours()).slice(-2) + ':'
+              + ('0' + nowIst.getMinutes()).slice(-2);
+
+  /* Age of the data, so a stopped trigger or a stalled runner is visible
+     instead of looking like a quiet market. Only meaningful while the market
+     is open - after close the last snapshot is SUPPOSED to be old. */
+  let age = -1;
+  if (at.indexOf(':') > 0) {
+    const p = at.split(':');
+    age = (nowIst.getHours() * 60 + nowIst.getMinutes())
+        - (parseInt(p[0], 10) * 60 + parseInt(p[1], 10));
+  }
+  const hm = nowIst.getHours() * 60 + nowIst.getMinutes();
+  const open = nowIst.getDay() >= 1 && nowIst.getDay() <= 5 && hm >= 560 && hm <= 940;
+  const stale = open && age > 25;
+
+  sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day
+      + (at ? '   snapshot ' + at : '')
+      + '   ·   drawn ' + drawn
+      + (stale ? '   ***  ' + age + ' MIN OLD  ***' : '')
+      + '     ranked on 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline')
+    .setFontWeight('bold').setFontSize(11)
+    .setFontColor(stale ? '#B3261E' : '#111111');
   sh.getRange(2, 1).setValue('GAP% = open vs prev close   OPEN% = now vs '
       + 'today\'s open   CHG% = now vs prev close      BUILD reads the whole '
       + 'day, SESSION reads since the open - bold where they disagree.   '

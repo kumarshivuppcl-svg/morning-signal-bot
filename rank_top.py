@@ -176,6 +176,10 @@ def build(day=None, top_n=TOP_N):
             "DCPR", "WCPR"]
     out = out[cols].round(3)
     out.insert(0, "Rank", range(1, len(out) + 1))
+    # Which snapshot this ranking was built from. Without it the sheet can
+    # show the date but not the time, so a trigger that has quietly stopped
+    # looks identical to one that is running.
+    out["AT"] = now
     out.index.name = "Symbol"
 
     dest = os.path.join(DATA_D, f"top15_{day}.csv")
