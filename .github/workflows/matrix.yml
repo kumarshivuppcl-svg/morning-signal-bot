@@ -1,33 +1,91 @@
 name: FnO Matrix
+
+# GitHub treats scheduled runs as best-effort and silently drops them under
+# load. On 2026-09-28 only 22 of 37 expected slots produced a snapshot, median
+# gap 18 minutes against a nominal 10.
+#
+# So the schedule no longer drives each snapshot. One run LOOPS internally
+# until the close, collecting on 10-minute boundaries, which means a full day
+# needs exactly ONE trigger to survive instead of 37. The several start times
+# below are redundancy: whichever fires first does the work, and the others
+# collapse into a single pending run behind the concurrency group.
+#
+# It also removes per-snapshot overhead -- checkout and pip ran every single
+# time before, roughly 3 of every 10 minutes.
+# Starts every 30 minutes through the session. Not because each one collects
+# -- the loop does that -- but so a job that dies mid-session is replaced
+# within ~30 minutes instead of leaving the rest of the day blank. While a job
+# IS running these collapse to a single pending run, so expect some
+# auto-cancelled entries in the Actions list: that is the mechanism working,
+# not a fault. Minutes are off :00/:30, which are GitHub's busiest and the
+# most likely to be dropped.
 on:
   schedule:
-    # Every 10 minutes, 03:00-10:59 UTC = 08:30-16:29 IST, Mon-Fri.
-    # The script's own guard keeps only 9:18-15:40 IST snapshots.
-    - cron: "*/10 3-10 * * 1-5"
+    - cron: "17,47 3-9 * * 1-5"   # 08:47-15:17 IST, every 30 min
   workflow_dispatch: {}
+
 concurrency:
   group: fno-matrix
-  cancel-in-progress: false
+  cancel-in-progress: false   # never kill a collection in flight
+
 permissions:
   contents: write
+
 jobs:
   snap:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 355      # under the 6h job ceiling; a later start covers the tail
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - run: pip install -r requirements.txt
-      - run: python fno_matrix.py
-      # Ranking reads the matrix it just wrote; a failure here must not cost
-      # us the snapshot, which is the part that cannot be recreated later.
-      - run: python rank_top.py || true
-      - name: Commit snapshot
+
+      - name: Collect every 10 minutes until the close
         run: |
-          git config user.name "matrix-bot"
+          set +e
+          git config user.name  "matrix-bot"
           git config user.email "matrix@bot"
-          git pull --rebase -q || true
-          git add data/ 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "matrix $(date -u +%H:%M)"
-          git push || true
+
+          # 15:35 IST == 10:05 UTC. The collector has its own 9:18-15:40 IST
+          # guard; this just stops the loop burning runner time after hours.
+          END=$(date -u -d "$(date -u +%Y-%m-%d) 10:05" +%s)
+
+          while : ; do
+            NOW=$(date -u +%s)
+            if [ "$NOW" -ge "$END" ]; then echo "past close, stopping"; break; fi
+
+            # Rebase BEFORE collecting so the collector appends to the newest
+            # file and the push afterwards is a fast-forward. If that cannot be
+            # done cleanly, take the remote as truth outright: an unpushed
+            # local commit is at most one snapshot, and the next pass rebuilds
+            # the current column anyway -- whereas a stuck rebase would wedge
+            # the loop and lose the entire rest of the day.
+            if ! git pull --rebase -q; then
+              git rebase --abort
+              git fetch -q origin
+              git reset --hard -q origin/master
+            fi
+
+            python fno_matrix.py
+            python rank_top.py || true
+
+            git add data/ 2>/dev/null
+            if ! git diff --cached --quiet; then
+              git commit -q -m "matrix $(date -u +%H:%M)"
+              for i in 1 2 3; do
+                git pull --rebase -q || git rebase --abort
+                git push -q && break
+                echo "push retry $i"; sleep 5
+              done
+            fi
+
+            # Align to the next 10-minute boundary rather than sleeping a
+            # fixed amount, so the columns land on clean times however long
+            # a collection took.
+            NOW=$(date -u +%s)
+            NEXT=$(( (NOW / 600 + 1) * 600 ))
+            if [ "$NEXT" -ge "$END" ]; then echo "next slot is past close"; break; fi
+            echo "next snapshot in $(( NEXT - NOW ))s"
+            sleep $(( NEXT - NOW ))
+          done
