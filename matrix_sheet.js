@@ -1,279 +1,330 @@
 /**
- * F&O MATRIX  —  Google Sheet renderer
+ * F&O MATRIX  —  Google Sheet
  *
- * Pulls the 10-minute matrix from GitHub and renders it:
- *   9 rows per script (price, vwap, cash vol, F&O vol/OI, call vol/OI, put vol/OI)
- *   every value an ABSOLUTE number. Ratios are yours to compute in-sheet:
- *   a time cell divided by that row's PrevDay is the headline ratio, and
- *   having the raw figures means PCR, skew and the rest are one division too.
+ * HOW IT FITS TOGETHER
+ *   GitHub publishes a fresh ranking and matrix every 10 minutes (verified:
+ *   40 snapshots on 29-Sep, one every ~10 min). This script copies them in.
  *
- * NOTE: cumulative rows (the volume ones) only ever rise, so the cell-vs-cell
- * arrow on them is always up and carries no information. It is meaningful on
- * the OI rows, which move both ways.
+ *   Sheet1       FORMULAS ONLY. It reads TOP15_DATA and recalculates by
+ *                itself. Its status line uses NOW(), so the data's age keeps
+ *                counting even when this script is NOT running -- a stopped
+ *                trigger now shows up in red instead of looking like a quiet
+ *                market.
+ *   TOP15_DATA   the raw ranking, overwritten each refresh. Don't edit it.
+ *   MATRIX       the full 10-minute matrix, all stocks.
  *
- * SETUP
- *  1. Copy your Sheet ID from its URL, between /d/ and /edit
- *  2. Paste it into SHEET_ID below (keep the quotes), Ctrl+S
- *  3. Run `testConnection` -> then `refreshNow`
- *  4. Triggers (clock) -> refreshNow | Time-driven | Minutes | Every 10 minutes
+ * SETUP (once)
+ *  1. SHEET_ID below = your Sheet URL, the part between /d/ and /edit.  Ctrl+S
+ *  2. Run  setupSheet1     -> builds the formulas and colours on Sheet1
+ *  3. Run  installTrigger  -> refreshNow every 10 minutes (approve the prompt)
+ *  4. Run  testTop         -> confirms the trigger exists and data is fresh
+ *
+ * No GitHub token is needed any more: the GitHub workflow now collects on its
+ * own schedule, so this script only reads public files.
  *
  * Past days:  loadDay('2026-09-04')
  */
 
 const SHEET_ID = 'PASTE_YOUR_SHEET_ID_HERE';
-const GH_TOKEN = 'PASTE_TOKEN_HERE';      /* now works - you own the repo */
 
 const REPO = 'kumarshivuppcl-svg/morning-signal-bot';
 const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
+const DATA_TAB = 'TOP15_DATA';
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
-/* Symbol, Metric, PrevDay, PrevDay2, PrevLastHr, DelivPct, DelivPctPrev */
-const FIXED = 7;
-const BLOCK = 9;   /* rows per stock - keep in step with METRICS */
+
+/* Sheet1 layout: title, live status, legend, header, then 15 data rows. */
+const TOP_HDR_ROW = 4, TOP_FIRST = 5, TOP_ROWS = 15;
+/* Where the refresh writes its bookkeeping on TOP15_DATA (clear of the CSV). */
+const META = { day: 'AB1', snap: 'AB2', fetched: 'AB3' };
+
+/* Display column -> ranking CSV header. Looked up BY NAME, so a change in
+   rank_top.py's column order cannot put values under the wrong heading. */
+const TOP_COLS = [
+  ['#', 'Rank'], ['SYMBOL', 'Symbol'], ['SCORE', 'SCORE'], ['VOL x', 'VOL'],
+  ['OPT x', 'OPT'], ['OI x', 'OIC'], ['GAP %', 'GAP'], ['OPEN %', 'OPN'],
+  ['CHG %', 'CHG'], ['sOI', 'SOI'], ['vs VWAP', 'VWP'], ['CPR w%', 'DCW'],
+  ['PCR', 'PCR'], ['LEV', 'LEV'], ['DELIV Δ', 'DLV'], ['dCPR', 'DCPR'],
+  ['wCPR', 'WCPR'], ['BUILD (day)', 'BUILD'], ['SESSION', 'SESS']
+];
 
 
-/* Fires a fresh collection on GitHub, then pulls the latest CSV in.
-   Because collection takes ~2 minutes, the pull shows the PREVIOUS snapshot —
-   so each 10-minute run collects now and displays the last one. Your Google
-   trigger therefore drives the whole system; GitHub's own cron is just backup. */
+/* ============================================================ refresh ===== */
+
+/* The 10-minute job. Copies data in; Sheet1's formulas do the rest. */
 function refreshNow() {
-  collect_();
   const day = istToday();
-  /* Ranked list first: it is the tab you actually read, and it must not be
-     skipped if the much larger matrix render fails or times out. */
-  renderTop_(day);
+  /* Ranking first: it is the tab you read, and it must not be skipped if the
+     much larger matrix render is slow. */
+  pullTop_(day);
+  ensureSheet1_();
   const res = fetchCsv_(day);
   if (res) { render_(res, day, 'MATRIX'); return; }
-  /* No snapshot for today yet (before 9:20, or a holiday). Wipe any leftover
-     data from a previous day so yesterday's numbers are never mistaken for
-     today's — reference columns are rebuilt on the first real snapshot. */
+  /* No snapshot yet today (before 9:20, or a holiday): blank MATRIX so an
+     old day is never mistaken for today. Sheet1 keeps the last ranking, and
+     its title shows which day that was. */
   clearStale_(day);
 }
 
-/* Draw the composite top 15 on the FIRST tab, so it is what opens.
-   Returns false when no ranking exists for `day` yet. */
-function renderTop_(day) {
+/* Redraw without waiting for the trigger. */
+function pullOnly() { refreshNow(); }
+function topOnly()  { pullTop_(istToday()); ensureSheet1_(); }
+
+/* Copy today's ranking CSV into TOP15_DATA. On any failure the previous data
+   is left in place -- and Sheet1's status line shows how old it is. */
+function pullTop_(day) {
   const r = UrlFetchApp.fetch(RAW + 'top15_' + day + '.csv?cb=' + Date.now(),
                               { muteHttpExceptions: true });
-  if (r.getResponseCode() !== 200) { console.log('no ranking for ' + day); return false; }
+  if (r.getResponseCode() !== 200) {
+    console.log('no ranking for ' + day + ' (HTTP ' + r.getResponseCode() + ')');
+    return false;
+  }
   const rows = Utilities.parseCsv(r.getContentText());
   if (!rows || rows.length < 2) return false;
 
-  /* Locate columns by NAME so a change in rank_top.py's column order cannot
-     silently shift the values under the headings. */
-  const h = {}; rows[0].forEach(function (n, i) { h[String(n).trim()] = i; });
-  const need = ['Symbol', 'Rank', 'SCORE', 'VOL', 'OPT', 'OIC', 'GAP', 'OPN',
-                'CHG', 'SOI', 'VWP', 'DCW', 'PCR', 'LEV', 'DLV', 'BUILD',
-                'SESS', 'DCPR', 'WCPR'];
-  for (let i = 0; i < need.length; i++) {
-    if (h[need[i]] === undefined) { console.log('ranking missing column ' + need[i]); return false; }
-  }
+  /* Numbers as numbers, so the formulas and colour rules can compare them. */
+  const w = Math.max.apply(null, rows.map(function (x) { return x.length; }));
+  const vals = rows.map(function (row, i) {
+    const out = [];
+    for (let c = 0; c < w; c++) {
+      const v = (row[c] === undefined ? '' : String(row[c]).trim());
+      const n = Number(v);
+      out.push(i > 0 && v !== '' && !isNaN(n) ? n : v);
+    }
+    return out;
+  });
 
-  const HEAD = ['#', 'SYMBOL', 'SCORE', 'VOL x', 'OPT x', 'OI x', 'GAP %',
-                'OPEN %', 'CHG %', 'sOI', 'vs VWAP', 'CPR w%', 'PCR', 'LEV',
-                'DELIV Δ', 'dCPR', 'wCPR', 'BUILD (day)', 'SESSION'];
-  const out = [HEAD];
-  const num = function (v) { const x = parseFloat(v); return isNaN(x) ? '' : x; };
-  for (let i = 1; i < rows.length; i++) {
-    const s = rows[i];
-    out.push([num(s[h.Rank]), s[h.Symbol], num(s[h.SCORE]), num(s[h.VOL]),
-              num(s[h.OPT]), num(s[h.OIC]), num(s[h.GAP]), num(s[h.OPN]),
-              num(s[h.CHG]), num(s[h.SOI]), num(s[h.VWP]), num(s[h.DCW]),
-              num(s[h.PCR]), num(s[h.LEV]), num(s[h.DLV]),
-              s[h.DCPR], s[h.WCPR], s[h.BUILD], s[h.SESS]]);
-  }
+  const h = {}; rows[0].forEach(function (n, i) { h[String(n).trim()] = i; });
+  const at = (h.AT !== undefined) ? String(rows[1][h.AT] || '').trim() : '';
 
   const ss = book_();
-  /* Write into Sheet1 - the tab that opens - rather than making you hunt for
-     a new one. Falls back to the first tab, and only creates a tab if the
-     book has neither. MATRIX is never overwritten. */
+  const d = ss.getSheetByName(DATA_TAB) || ss.insertSheet(DATA_TAB);
+  d.getRange('A1:Z60').clearContent();
+  d.getRange(1, 1, vals.length, w).setValues(vals);
+  d.getRange('AA1:AB3').setValues([
+    ['Ranking day', Utilities.parseDate(day, 'Asia/Kolkata', 'yyyy-MM-dd')],
+    ['Snapshot', at ? Utilities.parseDate(day + ' ' + at, 'Asia/Kolkata',
+                                          'yyyy-MM-dd HH:mm') : ''],
+    ['Fetched at', new Date()]
+  ]);
+  d.getRange('AB1').setNumberFormat('dd-mmm-yyyy');
+  d.getRange('AB2:AB3').setNumberFormat('dd-mmm-yyyy hh:mm');
+  console.log('ranking ' + day + ' snapshot ' + at + ' -> ' + DATA_TAB);
+  return true;
+}
+
+
+/* ============================================================== Sheet1 ===== */
+
+function top1Sheet_(ss) {
   let sh = ss.getSheetByName('Sheet1');
   if (!sh) {
     const first = ss.getSheets()[0];
-    sh = (first && first.getName() !== 'MATRIX') ? first
-                                                 : ss.insertSheet('TOP 15', 0);
+    sh = (first && first.getName() !== 'MATRIX' && first.getName() !== DATA_TAB)
+           ? first : ss.insertSheet('TOP 15', 0);
   }
+  return sh;
+}
+
+/* Build Sheet1 once. Everything on it is a formula or a colour RULE, so it
+   updates on its own whenever TOP15_DATA changes. Safe to re-run. */
+function setupSheet1() {
+  const ss = book_();
+  /* NOW() must count in IST, and recalculate every minute so the age of the
+     data keeps moving even when no refresh happens. */
+  ss.setSpreadsheetTimeZone('Asia/Kolkata');
+  ss.setRecalculationInterval(SpreadsheetApp.RecalculationInterval.ON_CHANGE_AND_MINUTE);
+  if (!ss.getSheetByName(DATA_TAB)) ss.insertSheet(DATA_TAB);
+
+  const sh = top1Sheet_(ss);
   sh.clear();
+  sh.clearConditionalFormatRules();
 
-  /* Snapshot time, read defensively: a ranking published before this column
-     existed simply shows no time rather than failing to render at all. */
-  const at = (h.AT !== undefined && rows.length > 1)
-               ? String(rows[1][h.AT] || '').trim() : '';
-  const nowIst = istNow_();
-  const drawn = ('0' + nowIst.getHours()).slice(-2) + ':'
-              + ('0' + nowIst.getMinutes()).slice(-2);
+  const D = "'" + DATA_TAB + "'!";
+  const day = D + '$' + META.day.replace(/(\d)/, '$$$1');
+  const snap = D + '$' + META.snap.replace(/(\d)/, '$$$1');
+  const got = D + '$' + META.fetched.replace(/(\d)/, '$$$1');
+  const open = 'AND(WEEKDAY(NOW(),2)<=5,MOD(NOW(),1)>=TIME(9,20,0),'
+             + 'MOD(NOW(),1)<=TIME(15,40,0))';
 
-  /* Age of the data, so a stopped trigger or a stalled runner is visible
-     instead of looking like a quiet market. Only meaningful while the market
-     is open - after close the last snapshot is SUPPOSED to be old. */
-  let age = -1;
-  if (at.indexOf(':') > 0) {
-    const p = at.split(':');
-    age = (nowIst.getHours() * 60 + nowIst.getMinutes())
-        - (parseInt(p[0], 10) * 60 + parseInt(p[1], 10));
-  }
-  const hm = nowIst.getHours() * 60 + nowIst.getMinutes();
-  const open = nowIst.getDay() >= 1 && nowIst.getDay() <= 5 && hm >= 560 && hm <= 940;
-  const stale = open && age > 25;
+  sh.getRange('A1').setFormula(
+    '="TOP 15 OPPORTUNITIES   "&IF(' + day + '="","",TEXT(' + day + ',"dd-mmm-yyyy"))'
+    + '&"      ranked 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline"')
+    .setFontWeight('bold').setFontSize(11);
 
-  sh.getRange(1, 1).setValue('TOP 15 OPPORTUNITIES   ' + day
-      + (at ? '   snapshot ' + at : '')
-      + '   ·   drawn ' + drawn
-      + (stale ? '   ***  ' + age + ' MIN OLD  ***' : '')
-      + '     ranked on 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline')
-    .setFontWeight('bold').setFontSize(11)
-    .setFontColor(stale ? '#B3261E' : '#111111');
-  sh.getRange(2, 1).setValue('GAP% = open vs prev close   OPEN% = now vs '
-      + 'today\'s open   CHG% = now vs prev close      BUILD reads the whole '
-      + 'day, SESSION reads since the open - bold where they disagree.   '
-      + 'vs VWAP = above(+)/below(-) the average traded price so far.   '
-      + 'dCPR/wCPR = price vs the daily/weekly central pivot range; CPR w% is '
-      + 'its width, narrow (bold) implies a trending day')
+  /* Two clocks. "data" = how old GitHub's snapshot is (the collector).
+     "sheet refreshed" = when THIS script last ran (the trigger). If the second
+     one climbs while the market is open, the trigger has stopped. */
+  sh.getRange('A2').setFormula(
+    '=IF(' + snap + '="","no ranking loaded yet - run topOnly",'
+    + '"snapshot "&TEXT(' + snap + ',"hh:mm")'
+    + '&"   ·   data "&TEXT(ROUND((NOW()-' + snap + ')*1440,0),"0")&" min old"'
+    + '&"   ·   sheet refreshed "&TEXT(ROUND((NOW()-' + got + ')*1440,0),"0")&" min ago"'
+    + '&IF(AND(' + open + ',(NOW()-' + got + ')*1440>25),'
+    + '"      ***  SHEET NOT REFRESHING - run testTop  ***",'
+    + 'IF(AND(' + open + ',(NOW()-' + snap + ')*1440>25),'
+    + '"      ***  DATA STALE - collector is behind  ***","")))')
+    .setFontSize(10);
+
+  sh.getRange('A3').setValue(
+    'GAP% open vs prev close · OPEN% now vs today\'s open · CHG% now vs prev close'
+    + '   |   BUILD = whole day, SESSION = since the open, bold where they disagree'
+    + '   |   vs VWAP +above / -below   |   dCPR/wCPR price vs daily/weekly pivot range,'
+    + ' CPR w% its width (bold = narrow, trending-day setup)')
     .setFontSize(9).setFontColor('#5F6368');
 
-  const n = out.length, w = HEAD.length;
-  const rng = sh.getRange(3, 1, n, w);
-  rng.setValues(out);
-  rng.setFontFamily('Roboto Mono').setFontSize(10);
-  sh.getRange(3, 1, 1, w).setFontWeight('bold')
-    .setBackground('#1F3864').setFontColor('#FFFFFF');
+  /* Header + one spilling formula per column. */
+  const hdr = TOP_COLS.map(function (c) { return c[0]; });
+  sh.getRange(TOP_HDR_ROW, 1, 1, hdr.length).setValues([hdr])
+    .setFontWeight('bold').setBackground('#1F3864').setFontColor('#FFFFFF')
+    .setHorizontalAlignment('center');
+  const block = D + '$A$2:$Z$' + (TOP_ROWS + 1);
+  const heads = D + '$A$1:$Z$1';
+  TOP_COLS.forEach(function (c, i) {
+    sh.getRange(TOP_FIRST, i + 1).setFormula(
+      '=ARRAYFORMULA(IFERROR(INDEX(' + block + ',0,MATCH("' + c[1] + '",'
+      + heads + ',0)),""))');
+  });
 
-  sh.getRange(4, 3, n - 1, 1).setNumberFormat('0.000');   /* SCORE */
-  sh.getRange(4, 4, n - 1, 6).setNumberFormat('0.00');    /* VOL..OPEN% */
-  sh.getRange(4, 9, n - 1, 1).setNumberFormat('0.00');    /* CHG% */
-  sh.getRange(4, 10, n - 1, 1).setNumberFormat('0.000');  /* sOI */
-  sh.getRange(4, 11, n - 1, 1).setNumberFormat('0.00');   /* vs VWAP */
-  sh.getRange(4, 12, n - 1, 1).setNumberFormat('0.000');  /* CPR width */
-  sh.getRange(4, 13, n - 1, 2).setNumberFormat('0.00');   /* PCR, LEV */
-  sh.getRange(4, 15, n - 1, 1).setNumberFormat('0.0');    /* DELIV */
-  sh.getRange(4, 2, n - 1, 1).setFontWeight('bold');
-
-  const stateColor = function (b) {
-    return b === 'LONG BUILD'  ? '#137333' : b === 'SHORT BUILD' ? '#B3261E' :
-           b === 'SHORT COVER' ? '#1A73E8' : '#B06000';
-  };
-  const zoneColor = function (z) {
-    return z === 'ABOVE' ? '#137333' : z === 'BELOW' ? '#B3261E' : '#5F6368';
-  };
-
-  for (let i = 1; i < n; i++) {
-    const row = out[i], at = 3 + i;
-    /* GAP, OPEN, CHG and vs-VWAP each green or red by sign. The first three
-       say whether a move is the gap, the session, or both; vs-VWAP says which
-       side of the day's average traded price it is happening on. */
-    [6, 7, 8, 10].forEach(function (k) {
-      if (row[k] !== '') {
-        sh.getRange(at, k + 1).setFontColor(
-          row[k] > 0 ? '#137333' : row[k] < 0 ? '#B3261E' : '#111111');
-      }
-    });
-    /* Options far hotter than cash = positioning is happening in the
-       derivatives; a low value on a big VOL is block or index flow. */
-    if (row[3] !== '' && row[3] >= 2) sh.getRange(at, 4).setFontWeight('bold');
-    if (row[4] !== '' && row[4] >= 2) sh.getRange(at, 5).setFontWeight('bold');
-    if (row[13] !== '' && row[13] >= 2) sh.getRange(at, 14).setFontWeight('bold');
-    /* A narrow central pivot range is the classic trending-day setup. */
-    if (row[11] !== '' && row[11] < 0.3) {
-      sh.getRange(at, 12).setFontWeight('bold').setFontColor('#B06000');
-    }
-
-    sh.getRange(at, 16).setFontColor(zoneColor(String(row[15])));
-    sh.getRange(at, 17).setFontColor(zoneColor(String(row[16])));
-
-    const bDay = String(row[17]), bSess = String(row[18]);
-    sh.getRange(at, 18).setFontColor(stateColor(bDay));
-    sh.getRange(at, 19).setFontColor(stateColor(bSess));
-    /* The two frames disagreeing IS the signal - the day was built one way
-       and the session is going the other. Bold it so it cannot be missed. */
-    if (bDay && bSess && bDay !== bSess) {
-      sh.getRange(at, 18, 1, 2).setFontWeight('bold');
-    }
-    if (i % 2 === 0) sh.getRange(at, 1, 1, w).setBackground('#F1F3F4');
+  const n = TOP_ROWS, R = function (col) { return sh.getRange(TOP_FIRST, col, n, 1); };
+  const fmt = { 3: '0.000', 4: '0.00', 5: '0.00', 6: '0.000', 7: '0.00', 8: '0.00',
+                9: '0.00', 10: '0.000', 11: '0.00', 12: '0.000', 13: '0.00',
+                14: '0.00', 15: '0.0' };
+  Object.keys(fmt).forEach(function (c) { R(Number(c)).setNumberFormat(fmt[c]); });
+  sh.getRange(TOP_FIRST, 1, n, hdr.length).setFontFamily('Roboto Mono').setFontSize(10);
+  R(2).setFontWeight('bold');
+  /* Zebra shading is plain formatting, not a rule: in Sheets only the first
+     matching rule applies to a cell, so a shading rule would block the colours. */
+  for (let i = 0; i < n; i += 2) {
+    sh.getRange(TOP_FIRST + i + 1, 1, 1, hdr.length).setBackground('#F1F3F4');
   }
 
-  sh.setFrozenRows(3);
+  /* Colour RULES -- these re-evaluate on every data change, no script needed. */
+  const rules = [];
+  const add = function (rng, f, font, bold) {
+    let b = SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(f).setRanges([rng]);
+    if (font) b = b.setFontColor(font);
+    if (bold) b = b.setBold(true);
+    rules.push(b.build());
+  };
+  const L = function (col) {           /* column letter of the first data row */
+    return '$' + String.fromCharCode(64 + col) + TOP_FIRST;
+  };
+  /* sign colours: GAP, OPEN, CHG, vs VWAP */
+  [7, 8, 9, 11].forEach(function (c) {
+    add(R(c), '=AND(ISNUMBER(' + L(c) + '),' + L(c) + '>0)', '#137333');
+    add(R(c), '=AND(ISNUMBER(' + L(c) + '),' + L(c) + '<0)', '#B3261E');
+  });
+  /* 2x and above is worth seeing at a glance: VOL, OPT, LEV */
+  [4, 5, 14].forEach(function (c) {
+    add(R(c), '=AND(ISNUMBER(' + L(c) + '),' + L(c) + '>=2)', null, true);
+  });
+  /* narrow central pivot range */
+  add(R(12), '=AND(ISNUMBER(' + L(12) + '),' + L(12) + '<0.3)', '#B06000', true);
+  /* pivot zones */
+  [16, 17].forEach(function (c) {
+    add(R(c), '=' + L(c) + '="ABOVE"', '#137333');
+    add(R(c), '=' + L(c) + '="BELOW"', '#B3261E');
+  });
+  /* build states -- the disagreeing version first, so it wins and goes bold */
+  const states = [['LONG BUILD', '#137333'], ['SHORT BUILD', '#B3261E'],
+                  ['SHORT COVER', '#1A73E8'], ['LONG UNWIND', '#B06000']];
+  const dis = 'AND(' + L(18) + '<>"",' + L(19) + '<>"",' + L(18) + '<>' + L(19) + ')';
+  [18, 19].forEach(function (c) {
+    states.forEach(function (s) {
+      add(R(c), '=AND(' + L(c) + '="' + s[0] + '",' + dis + ')', s[1], true);
+    });
+    states.forEach(function (s) { add(R(c), '=' + L(c) + '="' + s[0] + '"', s[1]); });
+  });
+  /* status line goes red when something has stopped */
+  add(sh.getRange('A2'), '=ISNUMBER(FIND("***",$A$2))', '#B3261E', true);
+  sh.setConditionalFormatRules(rules);
+
+  sh.setFrozenRows(TOP_HDR_ROW);
   sh.setFrozenColumns(2);
   sh.setColumnWidth(1, 34);
   sh.setColumnWidth(2, 106);
-  for (let c = 3; c <= 15; c++) sh.setColumnWidth(c, 56);
+  for (let c = 3; c <= 15; c++) sh.setColumnWidth(c, 58);
   sh.setColumnWidth(16, 62);
   sh.setColumnWidth(17, 62);
   sh.setColumnWidth(18, 104);
   sh.setColumnWidth(19, 104);
-  console.log('TOP 15 rendered for ' + day);
-  return true;
+  ss.setActiveSheet(sh);
+  ss.moveActiveSheet(1);
+  console.log('Sheet1 built: ' + TOP_COLS.length + ' formula columns, '
+              + rules.length + ' colour rules');
 }
 
-/* Ask GitHub to run a snapshot now. Non-fatal: if the token is missing or
-   rejected, we simply carry on and display whatever data already exists. */
-function collect_() {
-  if (!GH_TOKEN || GH_TOKEN.indexOf('PASTE') === 0) {
-    console.log('no token set - display only, no fresh collection');
-    return;
+/* Rebuild Sheet1 only if its formulas are missing (first run, or overwritten). */
+function ensureSheet1_() {
+  const ss = book_();
+  const f = top1Sheet_(ss).getRange(TOP_FIRST, 3).getFormula();
+  if (f.indexOf(DATA_TAB) < 0) {
+    console.log('Sheet1 has no formulas yet - building it');
+    setupSheet1();
   }
-  const ist = istNow_();
-  if (ist.getDay() === 0 || ist.getDay() === 6) return;
-  const hm = ist.getHours() * 60 + ist.getMinutes();
-  if (hm < 558 || hm > 940) { console.log('outside market hours'); return; }
-
-  const res = UrlFetchApp.fetch(
-    'https://api.github.com/repos/' + REPO + '/actions/workflows/matrix.yml/dispatches',
-    { method: 'post', contentType: 'application/json',
-      headers: { 'Authorization': 'Bearer ' + GH_TOKEN,
-                 'Accept': 'application/vnd.github+json' },
-      payload: JSON.stringify({ ref: 'master' }),
-      muteHttpExceptions: true });
-  console.log(res.getResponseCode() === 204
-    ? 'snapshot triggered'
-    : 'trigger failed HTTP ' + res.getResponseCode() + ' ' +
-      res.getContentText().slice(0, 120));
 }
 
-function istNow_() {
-  const n = new Date();
-  return new Date(n.getTime() + n.getTimezoneOffset() * 60000 + 19800000);
+
+/* ============================================================= trigger ===== */
+
+/* Creates the 10-minute trigger in code, replacing any earlier ones -- so it
+   cannot silently be missing, duplicated, or pointed at the wrong function. */
+function installTrigger() {
+  let removed = 0;
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'refreshNow') { ScriptApp.deleteTrigger(t); removed++; }
+  });
+  ScriptApp.newTrigger('refreshNow').timeBased().everyMinutes(10).create();
+  console.log('removed ' + removed + ' old refreshNow trigger(s); installed one new '
+              + 'every-10-minutes trigger');
+  listTriggers_();
 }
 
-/* Pull only, no collection - use when you just want to redraw the sheet. */
-function pullOnly() {
-  const day = istToday();
-  renderTop_(day);
-  const res = fetchCsv_(day);
-  if (res) render_(res, day, 'MATRIX'); else clearStale_(day);
+function listTriggers_() {
+  const t = ScriptApp.getProjectTriggers();
+  if (!t.length) { console.log('   NO TRIGGERS in this project'); return 0; }
+  t.forEach(function (x) {
+    console.log('   trigger -> ' + x.getHandlerFunction() + '  (' + x.getEventType() + ')');
+  });
+  return t.filter(function (x) { return x.getHandlerFunction() === 'refreshNow'; }).length;
 }
 
-/* Draw only the ranked list - fastest way to see today's opportunities. */
-function topOnly() { renderTop_(istToday()); }
 
-/* Run this if the tab stays blank. It reports each step separately so the
-   failing one is obvious, instead of a silent no-op. */
+/* ========================================================= diagnostics ===== */
+
+/* Run if Sheet1 stops changing. Each step reports separately, so the broken
+   one is obvious. */
 function testTop() {
   const day = istToday();
-  console.log('1. IST date used: ' + day);
-
+  console.log('1. IST date: ' + day);
   if (!SHEET_ID || SHEET_ID.indexOf('PASTE') === 0) {
-    console.log('2. STOP - SHEET_ID is still the placeholder. Copy your Sheet '
-              + 'ID from its URL, the part between /d/ and /edit');
-    return;
+    console.log('2. STOP - SHEET_ID is still the placeholder'); return;
   }
   let ss;
   try { ss = book_(); } catch (e) { console.log('2. STOP - ' + e.message); return; }
-  console.log('2. opened book: "' + ss.getName() + '"');
-  console.log('3. tabs present: '
-            + ss.getSheets().map(function (s) { return s.getName(); }).join(', '));
+  console.log('2. book: "' + ss.getName() + '"  timezone ' + ss.getSpreadsheetTimeZone());
 
-  const url = RAW + 'top15_' + day + '.csv?cb=' + Date.now();
-  const r = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  console.log('4. ranking file HTTP ' + r.getResponseCode() + '  ' + url);
-  if (r.getResponseCode() !== 200) {
-    console.log('   -> no ranking published for ' + day + ' yet. Before the '
-              + 'first snapshot (9:20 IST), on a holiday, or the date is off.');
-    return;
-  }
-  const rows = Utilities.parseCsv(r.getContentText());
-  console.log('5. parsed ' + rows.length + ' lines; header: ' + rows[0].join(','));
-  const ok = renderTop_(day);
-  console.log('6. render returned ' + ok
-            + (ok ? ' - look at the first tab' : ' - see the message above'));
+  console.log('3. triggers in this project:');
+  const n = listTriggers_();
+  console.log(n === 1 ? '   OK - one refreshNow trigger'
+            : n === 0 ? '   PROBLEM - no refreshNow trigger: run installTrigger'
+            : '   PROBLEM - ' + n + ' refreshNow triggers: run installTrigger to reset');
+
+  const r = UrlFetchApp.fetch(RAW + 'top15_' + day + '.csv?cb=' + Date.now(),
+                              { muteHttpExceptions: true });
+  console.log('4. ranking on GitHub: HTTP ' + r.getResponseCode()
+            + (r.getResponseCode() === 200 ? '' : '  (none yet today - before 9:20 or a holiday)'));
+
+  const d = ss.getSheetByName(DATA_TAB);
+  if (!d) { console.log('5. no ' + DATA_TAB + ' tab yet - run refreshNow'); return; }
+  const got = d.getRange(META.fetched).getValue(), snap = d.getRange(META.snap).getValue();
+  const now = new Date();
+  console.log('5. last refresh ' + (got ? Math.round((now - got) / 60000) + ' min ago' : 'never')
+            + ';  data snapshot ' + (snap ? Math.round((now - snap) / 60000) + ' min old' : 'none'));
+
+  const f = top1Sheet_(ss).getRange(TOP_FIRST, 3).getFormula();
+  console.log('6. Sheet1 formulas: ' + (f.indexOf(DATA_TAB) >= 0 ? 'present'
+            : 'MISSING - run setupSheet1'));
 }
 
 function loadDay(d) {
@@ -294,6 +345,8 @@ function testConnection() {
 }
 
 
+/* ============================================================== MATRIX ===== */
+
 function book_() {
   if (!SHEET_ID || SHEET_ID.indexOf('PASTE') === 0) {
     throw new Error('Set SHEET_ID at the top — copy it from your Sheet URL ' +
@@ -301,7 +354,6 @@ function book_() {
   }
   return SpreadsheetApp.openById(SHEET_ID);
 }
-
 
 function fetchCsv_(day) {
   const res = UrlFetchApp.fetch(RAW + 'matrix_' + day + '.csv?cb=' + Date.now(),
@@ -311,8 +363,7 @@ function fetchCsv_(day) {
   return (rows && rows.length >= 2) ? rows : null;
 }
 
-/* Blank the MATRIX tab when there is no data for `day` yet, leaving a clear
-   note. Keeps the sheet honest at the start of every trading day. */
+/* Blank the MATRIX tab when there is no data for `day` yet. */
 function clearStale_(day) {
   const ss = book_();
   const sh = ss.getSheetByName('MATRIX');
@@ -326,39 +377,38 @@ function clearStale_(day) {
 }
 
 function render_(rows, day, tabName) {
-
   const nCol = rows[0].length;
-  const out = [], colors = [];
+  /* Reference columns are every header WITHOUT a time in it. Derived from the
+     file, because a hardcoded count went stale each time a column was added
+     (it was still 7 when there were 12, so arrows ran across Open and the
+     pivot levels as if they were snapshots). */
+  let FIXED = 0;
+  while (FIXED < nCol && String(rows[0][FIXED]).indexOf(':') < 0) FIXED++;
+  /* Rows per stock, counted from the data for the same reason. */
+  let BLOCK = 0;
+  while (1 + BLOCK < rows.length && rows[1 + BLOCK][0] === rows[1][0]) BLOCK++;
+  BLOCK = Math.max(BLOCK, 1);
 
-  // header
+  const out = [], colors = [];
   out.push(rows[0].slice());
-  colors.push(rows[0].map(() => '#000000'));
+  colors.push(rows[0].map(function () { return '#000000'; }));
 
   let lastSym = '';
   for (let r = 1; r < rows.length; r++) {
     const src = rows[r], line = [], col = [];
     for (let c = 0; c < nCol; c++) {
-      let raw = (src[c] || '').trim();
+      const raw = (src[c] || '').trim();
       if (c === 0) {                         /* symbol shown once per block */
-        const shown = (raw === lastSym) ? '' : raw;
+        line.push(raw === lastSym ? '' : raw);
         lastSym = raw;
-        line.push(shown);
         col.push('#111111');
         continue;
       }
-      /* Reference columns are absolute prior-session figures now, not ratios,
-         so the >1 green / <1 red tint no longer means anything here. */
-      if (c < FIXED) {
-        line.push(raw);
-        col.push('#111111');
-        continue;
-      }
+      if (c < FIXED) { line.push(raw); col.push('#111111'); continue; }
       if (raw === '') { line.push(''); col.push('#000000'); continue; }
       const v = parseFloat(raw);
       if (isNaN(v)) { line.push(raw); col.push('#111111'); continue; }
-
-      // arrow vs the previous non-empty time cell in this row
-      let prev = NaN;
+      let prev = NaN;                         /* vs previous non-empty snapshot */
       for (let k = c - 1; k >= FIXED; k--) {
         const p = parseFloat((src[k] || '').trim());
         if (!isNaN(p)) { prev = p; break; }
@@ -373,31 +423,28 @@ function render_(rows, day, tabName) {
   }
 
   const ss = book_();
-  let sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+  const sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
   sh.clear();
   const rng = sh.getRange(1, 1, out.length, nCol);
   rng.setValues(out);
   rng.setFontColors(colors);
   rng.setFontFamily('Roboto Mono');
   rng.setFontSize(9);
-
   sh.getRange(1, 1, 1, nCol).setFontWeight('bold').setBackground('#1F3864')
     .setFontColor('#FFFFFF');
   sh.setFrozenRows(1);
   sh.setFrozenColumns(2);
   sh.setColumnWidth(1, 110);
   sh.setColumnWidth(2, 80);
-
-  // alternate shading per stock block so stocks read as groups
   for (let r = 1; r < out.length; r += BLOCK) {
     if (((r - 1) / BLOCK) % 2 === 1) {
       sh.getRange(r + 1, 1, Math.min(BLOCK, out.length - r), nCol)
         .setBackground('#F1F3F4');
     }
   }
-  console.log(tabName + ': ' + out.length + ' rows x ' + nCol + ' cols');
+  console.log(tabName + ': ' + out.length + ' rows x ' + nCol + ' cols, '
+              + FIXED + ' reference cols, ' + BLOCK + ' rows per stock');
 }
-
 
 /** ratios read best at 2dp; large raw counts get thousands separators. */
 function fmt_(v) {
@@ -408,6 +455,6 @@ function fmt_(v) {
 function istToday() {
   const n = new Date();
   const i = new Date(n.getTime() + n.getTimezoneOffset() * 60000 + 5.5 * 3600000);
-  const p = x => (x < 10 ? '0' : '') + x;
+  const p = function (x) { return (x < 10 ? '0' : '') + x; };
   return i.getFullYear() + '-' + p(i.getMonth() + 1) + '-' + p(i.getDate());
 }
