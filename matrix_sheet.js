@@ -279,22 +279,37 @@ function setupCalc() {
     .setFontWeight('bold');
   /* One slot per parameter, each with a range name the formulas use. A value
      already typed in a slot is kept on rebuild; an empty slot gets the default. */
+  /* [range name, label, default, note, earlier label]. The earlier label lets
+     a rebuild recognise a slot saved under the old short name and keep its value. */
   const PARAMS = [
-    ['RSI_PERIOD', 'RSI period',        14,  'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)'],
-    ['OI_EMA',     'OI EMA period',     9,   'EMA of Net / CE / PE change in OI, 10-minute bars  (name: OI_EMA)'],
-    ['PX_EMA',     'Price EMA period',  20,  'EMA of the 10-minute PRICE  (name: PX_EMA)'],
-    ['FLAT_BAND',  'Flat band %',       0.1, 'price within this % of its EMA = consolidating  (name: FLAT_BAND)'],
-    ['PIN_BAND',   'Pin band %',        1,   'price within this % of GEX STRIKE = at the pin  (name: PIN_BAND)'],
-    ['GEX_MIN',    'GEX minimum %',     3,   'GEX below this % of the previous day cash volume = too small to matter  (name: GEX_MIN)'],
-    ['ATR_PERIOD', 'ATR period',        14,  'daily sessions, Wilder smoothing  (name: ATR_PERIOD; at most 30)'],
-    ['CPR_NARROW', 'CPR narrow %',      0.25, 'daily CPR width at or below this % = NARROW (trend day)  (name: CPR_NARROW)'],
-    ['CPR_WIDE',   'CPR wide %',        0.75, 'daily CPR width at or above this % = WIDE (range day)  (name: CPR_WIDE)']
+    ['RSI_PERIOD', 'Relative Strength Index period', 14,
+     'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)', 'RSI period'],
+    ['OI_EMA', 'Open Interest moving average period', 9,
+     'exponential moving average of the Net / Call / Put change in open interest, 10-minute bars  (name: OI_EMA)',
+     'OI EMA period'],
+    ['PX_EMA', 'Price moving average period', 20,
+     'exponential moving average of the 10-minute price  (name: PX_EMA)', 'Price EMA period'],
+    ['FLAT_BAND', 'Flat band %', 0.1,
+     'price within this % of its moving average = consolidating  (name: FLAT_BAND)', 'Flat band %'],
+    ['PIN_BAND', 'Pin band %', 1,
+     'price within this % of the Pin Strike = at the pin  (name: PIN_BAND)', 'Pin band %'],
+    ['GEX_MIN', 'Gamma exposure minimum %', 3,
+     'gamma exposure below this % of the previous day cash volume = too small to matter  (name: GEX_MIN)',
+     'GEX minimum %'],
+    ['ATR_PERIOD', 'Average True Range period', 14,
+     'daily sessions, Wilder smoothing, at most 30  (name: ATR_PERIOD)', 'ATR period'],
+    ['CPR_NARROW', 'Central Pivot Range narrow %', 0.25,
+     'daily Central Pivot Range width at or below this % of the pivot = NARROW (trend day)  (name: CPR_NARROW)',
+     'CPR narrow %'],
+    ['CPR_WIDE', 'Central Pivot Range wide %', 0.75,
+     'daily Central Pivot Range width at or above this % of the pivot = WIDE (range day)  (name: CPR_WIDE)',
+     'CPR wide %']
   ];
   const params = [];
   for (let i = 0; i < 9; i++) {
     const old = keep.params ? keep.params[i] : ['', '', ''];
     const def = PARAMS[i];
-    if (def && (old[0] === '' || old[0] === def[1])) {
+    if (def && (old[0] === '' || old[0] === def[1] || old[0] === def[4])) {
       params.push([def[1], old[1] === '' ? def[2] : old[1], def[3]]);
     } else {
       params.push(old);
@@ -312,14 +327,14 @@ function setupCalc() {
   };
   sh.getRange('E4').setValue('REFERENCE  (yesterday and today\'s open)').setFontWeight('bold');
   const refs = [
-    ['Prev close',               ref('PRICE', 'PrevDay'),     ''],
-    ['Close day before',         ref('PRICE', 'PrevDay2'),    ''],
-    ['Today open',               ref('PRICE', 'Open'),        ''],
-    ['Daily CPR  top / bottom',  ref('PRICE', 'dTC'),         ref('PRICE', 'dBC')],
-    ['Weekly CPR  top / bottom', ref('PRICE', 'wTC'),         ref('PRICE', 'wBC')],
-    ['Cash vol  prev / before',  ref('CASH VOL', 'PrevDay'),  ref('CASH VOL', 'PrevDay2')],
-    ['Delivery %  prev / before', ref('CASH VOL', 'DelivPct'), ref('CASH VOL', 'DelivPctPrev')],
-    ['Futures  vol / OI  prev',  ref('FUT VOL', 'PrevDay'),   ref('FUT OI', 'PrevDay')]
+    ['Previous Close',                                ref('PRICE', 'PrevDay'),     ''],
+    ['Close of the Day Before',                       ref('PRICE', 'PrevDay2'),    ''],
+    ['Today Open',                                    ref('PRICE', 'Open'),        ''],
+    ['Daily Central Pivot Range  Top / Bottom',       ref('PRICE', 'dTC'),         ref('PRICE', 'dBC')],
+    ['Weekly Central Pivot Range  Top / Bottom',      ref('PRICE', 'wTC'),         ref('PRICE', 'wBC')],
+    ['Cash Volume  Previous Day / Day Before',        ref('CASH VOL', 'PrevDay'),  ref('CASH VOL', 'PrevDay2')],
+    ['Delivery %  Previous Day / Day Before',         ref('CASH VOL', 'DelivPct'), ref('CASH VOL', 'DelivPctPrev')],
+    ['Futures Volume / Open Interest  Previous Day',  ref('FUT VOL', 'PrevDay'),   ref('FUT OI', 'PrevDay')]
   ];
   refs.forEach(function (row, i) {
     sh.getRange(5 + i, 5).setValue(row[0]);
@@ -333,7 +348,13 @@ function setupCalc() {
   sh.getRange(f - 2, 1).setValue('STEP 1  -  Raw inputs for this stock, every 10 minutes '
                                  + '(absolute numbers from NSE / Breeze)').setFontWeight('bold');
   const hdr1 = ['Time'].concat(CALC_METRICS);
-  sh.getRange(f - 1, 1, 1, hdr1.length).setValues([hdr1]);
+  /* Full names in the header; the formulas carry the data keys themselves. */
+  sh.getRange(f - 1, 1, 1, hdr1.length).setValues([['Time (10-minute snapshot)', 'Price',
+    'Volume Weighted Average Price', 'Cash Volume (shares)', 'Futures + Options Volume (contracts)',
+    'Futures + Options Open Interest (contracts)', 'Call Volume (ATM +/-5 strikes)',
+    'Call Open Interest (ATM +/-5 strikes)', 'Put Volume (ATM +/-5 strikes)',
+    'Put Open Interest (ATM +/-5 strikes)', 'Futures Volume (shares)',
+    'Futures Open Interest (shares)', 'Futures Price']]);
   /* (cond)*(cond) form: same result in Sheets and in Excel if downloaded */
   sh.getRange(f, 1).setFormula('=IFERROR(FILTER(' + L + '$C:$C,(' + L + '$A:$A=$B$2)*('
                                + L + '$B:$B="PRICE")),"")');
@@ -342,8 +363,8 @@ function setupCalc() {
     const line = [];
     for (let c = 2; c <= hdr1.length; c++) {
       const col = String.fromCharCode(64 + c);
-      line.push('=IF($A' + r + '="","",IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|"&' + col
-                + '$' + (f - 1) + '&"|"&$A' + r + ',' + L + '$E:$E,0)),""))');
+      line.push('=IF($A' + r + '="","",IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|'
+                + CALC_METRICS[c - 2] + '|"&$A' + r + ',' + L + '$E:$E,0)),""))');
     }
     raw.push(line);
   }
@@ -354,8 +375,9 @@ function setupCalc() {
      then avg = (previous avg x (N-1) + this move) / N. N is RSI_PERIOD. */
   sh.getRange(f - 2, 15).setValue('STEP 2  -  Example: RSI(RSI_PERIOD) on the 10-minute PRICE '
                                   + '(change B5 and watch it recalculate)').setFontWeight('bold');
-  sh.getRange(f - 1, 15, 1, 7).setValues([['Change', 'Gain', 'Loss', 'Avg gain',
-                                           'Avg loss', 'RS', 'RSI']]);
+  sh.getRange(f - 1, 15, 1, 7).setValues([['Price Change', 'Gain', 'Loss', 'Average Gain',
+    'Average Loss', 'Relative Strength (Average Gain / Average Loss)',
+    'Relative Strength Index (RSI)']]);
   const rsi = [];
   for (let r = f; r <= last; r++) {
     const n = 'ROW()-' + f;                  /* moves seen so far at this row */
@@ -400,10 +422,13 @@ function setupCalc() {
   };
   sh.getRange(f - 2, S3).setValue('STEP 3  -  Change in OI, its EMA (OI_EMA), price EMA (PX_EMA) '
                                   + 'and the setups they define').setFontWeight('bold');
-  sh.getRange(f - 1, S3, 1, S3N).setValues([['CALL OI fixed band', 'PUT OI fixed band',
-    'CE OI chg', 'PE OI chg', 'Net OI chg  PE-CE',
-    'EMA Net', 'EMA CE chg', 'EMA PE chg', 'EMA Price', 'Price vs VWAP %', 'Price vs EMA %',
-    'Net vs EMA cross', 'Alignment', 'Setup', 'Hold']]);
+  sh.getRange(f - 1, S3, 1, S3N).setValues([['Call Open Interest (fixed band)',
+    'Put Open Interest (fixed band)', 'Call Open Interest Change', 'Put Open Interest Change',
+    'Net Open Interest Change (Put - Call)', 'Exponential Moving Average of Net Change',
+    'Exponential Moving Average of Call Change', 'Exponential Moving Average of Put Change',
+    'Exponential Moving Average of Price', 'Price Distance from VWAP %',
+    'Price Distance from its Moving Average %', 'Net Change Crossing its Moving Average',
+    'Alignment (Net Change vs Average, Price vs VWAP)', 'Setup', 'Hold Signal']]);
   /* EMA of column `src` whose values start on row `s0`, period named `p`. */
   const ema = function (src, me, s0, p, r) {
     const k = '(ROW()-' + (s0 - 1) + ')';          /* values seen so far */
@@ -475,9 +500,14 @@ function setupCalc() {
   const C4 = function (i) { return cl(S4 + i); };
   sh.getRange(f - 2, S4).setValue('STEP 4  -  Delta-weighted OI (DOI) and gamma exposure (GEX), '
                                   + 'shares;  pin = GEX STRIKE').setFontWeight('bold');
-  sh.getRange(f - 1, S4, 1, S4N).setValues([['CALL DOI', 'PUT DOI', 'Net DOI', 'Net DOI % of FUT OI',
-    'CALL GEX', 'PUT GEX', 'GEX total', 'Net GEX  CALL-PUT', 'GEX % of prev cash vol',
-    'GEX STRIKE', 'Pin distance %', 'Read', 'Expiry', 'Days to expiry', 'Trading days left']]);
+  sh.getRange(f - 1, S4, 1, S4N).setValues([['Call Delta-Weighted Open Interest (shares)',
+    'Put Delta-Weighted Open Interest (shares)', 'Net Delta-Weighted Open Interest (shares)',
+    'Net Delta-Weighted Open Interest as % of Futures Open Interest',
+    'Call Gamma Exposure (shares per 1% move)', 'Put Gamma Exposure (shares per 1% move)',
+    'Total Gamma Exposure (shares per 1% move)', 'Net Gamma Exposure (Call - Put)',
+    'Total Gamma Exposure as % of Previous Day Cash Volume', 'Pin Strike (most gamma)',
+    'Price Distance from Pin Strike %', 'Gamma Reading', 'Expiry Date',
+    'Calendar Days to Expiry', 'Trading Days to Expiry (excluding holidays)']]);
   /* A date may arrive as text (Excel) or already converted (Sheets). */
   const asDate = function (x) { return 'IF(ISNUMBER(' + x + '),' + x + ',DATEVALUE(' + x + '))'; };
   const dataDay = 'IFERROR(INDEX(' + "'" + REF_TAB + "'!" + '$D:$D,MATCH("_ALL|DAY|Date",'
@@ -529,12 +559,12 @@ function setupCalc() {
     .setRanges([tag4]).build());
   sh.setConditionalFormatRules(cf);
 
-  /* --- STEP 5: range -- IV expected move, day's range, ATR, CPR width ---- */
+  /* --- STEP 5: range boundaries (price levels) -------------------------- */
   /* IV is NSE's ATM figure, annualised on CALENDAR days (that is how NSE's
      IV is computed), so moves scale with sqrt(days/365).
      Day high/low here come from the 10-minute snapshots, so they can miss a
      spike between snapshots. ATR is the latest value from STEP 6. */
-  const S5 = S4 + S4N + 1, S5N = 14;
+  const S5 = S4 + S4N + 1, S5N = 17;
   const C5 = function (i) { return cl(S5 + i); };
   const DTE = cl(S4 + 13);                  /* STEP 4: days to expiry */
   const RF = "'" + REF_TAB + "'!";
@@ -546,48 +576,60 @@ function setupCalc() {
   const atrRng = '$' + C6(5) + '$' + f + ':$' + C6(5) + '$' + (f + S6ROWS - 1);
   const lastAtr = 'INDEX(' + atrRng + ',MAX(FILTER(ROW(' + atrRng + '),ISNUMBER(' + atrRng + ')))-'
                   + (f - 1) + ')';
-  const cprW = function (tc, bc) {
-    return 'IFERROR(ABS(' + refv('PRICE', tc) + '-' + refv('PRICE', bc) + ')/(('
-      + refv('PRICE', tc) + '+' + refv('PRICE', bc) + ')/2)*100,"")';
-  };
-  sh.getRange(f - 2, S5).setValue('STEP 5  -  Range: IV expected move, range used, ATR, CPR width')
-    .setFontWeight('bold');
-  sh.getRange(f - 1, S5, 1, S5N).setValues([['ATM IV %', '1-day move (IV)', 'Move to expiry (IV)',
-    'Upper (expiry)', 'Lower (expiry)', 'Day high (snaps)', 'Day low (snaps)',
-    'Range used % of 1-day move', 'ATR', 'Range used % of ATR', '1-day move / ATR',
-    'Daily CPR width %', 'CPR type', 'Weekly CPR width %']]);
+  sh.getRange(f - 2, S5).setValue('STEP 5  -  Range boundaries: implied volatility, Average True Range, '
+                                  + 'Central Pivot Range').setFontWeight('bold');
+  sh.getRange(f - 1, S5, 1, S5N).setValues([[
+    'ATM Implied Volatility (% a year)',
+    'Expected One-Day Move (points)',
+    'Implied Volatility Day Range - Upper (previous close + one-day move)',
+    'Implied Volatility Day Range - Lower (previous close - one-day move)',
+    'Expected Move to Expiry (points)',
+    'Implied Volatility Expiry Range - Upper (price + move to expiry)',
+    'Implied Volatility Expiry Range - Lower (price - move to expiry)',
+    'Day High So Far (10-minute snapshots)',
+    'Day Low So Far (10-minute snapshots)',
+    'Average True Range (points, from STEP 6)',
+    'Average True Range Day Range - Upper (day low + Average True Range)',
+    'Average True Range Day Range - Lower (day high - Average True Range)',
+    'Daily Central Pivot Range - Top',
+    'Daily Central Pivot Range - Bottom',
+    'Daily Central Pivot Range Type (Narrow / Normal / Wide)',
+    'Weekly Central Pivot Range - Top',
+    'Weekly Central Pivot Range - Bottom']]);
+  const prevClose = refv('PRICE', 'PrevDay');
   const s5 = [];
   for (let r = f; r <= last; r++) {
     const c = function (i) { return C5(i) + r; };
     s5.push([
       fixed('ATM IV', r),
       '=IF(OR($B' + r + '="",' + c(0) + '=""),"",$B' + r + '*' + c(0) + '/100*SQRT(1/365))',
+      '=IF(OR(' + c(1) + '="",N(' + prevClose + ')=0),"",' + prevClose + '+' + c(1) + ')',
+      '=IF(OR(' + c(1) + '="",N(' + prevClose + ')=0),"",' + prevClose + '-' + c(1) + ')',
       '=IF(OR(' + c(1) + '="",' + DTE + r + '=""),"",$B' + r + '*' + c(0) + '/100*SQRT(MAX('
         + DTE + r + ',1)/365))',
-      '=IF(' + c(2) + '="","",$B' + r + '+' + c(2) + ')',
-      '=IF(' + c(2) + '="","",$B' + r + '-' + c(2) + ')',
+      '=IF(' + c(4) + '="","",$B' + r + '+' + c(4) + ')',
+      '=IF(' + c(4) + '="","",$B' + r + '-' + c(4) + ')',
       '=IF($B' + r + '="","",MAX($B$' + f + ':$B' + r + '))',
       '=IF($B' + r + '="","",MIN($B$' + f + ':$B' + r + '))',
-      '=IF(OR(' + c(1) + '="",' + c(5) + '=""),"",(' + c(5) + '-' + c(6) + ')/' + c(1) + '*100)',
       '=IF($B' + r + '="","",IFERROR(' + lastAtr + ',""))',
-      '=IF(OR(' + c(5) + '="",N(' + c(8) + ')=0),"",(' + c(5) + '-' + c(6) + ')/' + c(8) + '*100)',
-      '=IF(OR(' + c(1) + '="",N(' + c(8) + ')=0),"",' + c(1) + '/' + c(8) + ')',
-      '=IF($B' + r + '="","",' + cprW('dTC', 'dBC') + ')',
-      '=IF(' + c(11) + '="","",IF(' + c(11) + '<=CPR_NARROW,"NARROW",IF(' + c(11)
-        + '>=CPR_WIDE,"WIDE","NORMAL")))',
-      '=IF($B' + r + '="","",' + cprW('wTC', 'wBC') + ')'
+      '=IF(OR(' + c(8) + '="",N(' + c(9) + ')=0),"",' + c(8) + '+' + c(9) + ')',
+      '=IF(OR(' + c(7) + '="",N(' + c(9) + ')=0),"",' + c(7) + '-' + c(9) + ')',
+      '=IF($B' + r + '="","",' + refv('PRICE', 'dTC') + ')',
+      '=IF($B' + r + '="","",' + refv('PRICE', 'dBC') + ')',
+      /* width as % of the pivot decides the type; the thresholds are parameters */
+      '=IF(OR(N(' + c(12) + ')=0,N(' + c(13) + ')=0),"",IF(ABS(' + c(12) + '-' + c(13) + ')/(('
+        + c(12) + '+' + c(13) + ')/2)*100<=CPR_NARROW,"NARROW",IF(ABS(' + c(12) + '-' + c(13)
+        + ')/((' + c(12) + '+' + c(13) + ')/2)*100>=CPR_WIDE,"WIDE","NORMAL")))',
+      '=IF($B' + r + '="","",' + refv('PRICE', 'wTC') + ')',
+      '=IF($B' + r + '="","",' + refv('PRICE', 'wBC') + ')'
     ]);
   }
   sh.getRange(f, S5, CALC_ROWS, S5N).setFormulas(s5);
   sh.getRange(f, S5, CALC_ROWS, 1).setNumberFormat('0.00');
-  sh.getRange(f, S5 + 1, CALC_ROWS, 6).setNumberFormat('#,##0.00');
-  sh.getRange(f, S5 + 7, CALC_ROWS, 1).setNumberFormat('0');
-  sh.getRange(f, S5 + 8, CALC_ROWS, 1).setNumberFormat('#,##0.00');
-  sh.getRange(f, S5 + 9, CALC_ROWS, 1).setNumberFormat('0');
-  sh.getRange(f, S5 + 10, CALC_ROWS, 2).setNumberFormat('0.00');
-  sh.getRange(f, S5 + 12, CALC_ROWS, 1).setHorizontalAlignment('center').setFontWeight('bold');
-  sh.getRange(f, S5 + 13, CALC_ROWS, 1).setNumberFormat('0.00');
-  const tag5 = sh.getRange(C5(12) + f + ':' + C5(12) + last);
+  sh.getRange(f, S5 + 1, CALC_ROWS, 13).setNumberFormat('#,##0.00');
+  sh.getRange(f, S5 + 14, CALC_ROWS, 1).setHorizontalAlignment('center').setFontWeight('bold');
+  sh.getRange(f, S5 + 15, CALC_ROWS, 2).setNumberFormat('#,##0.00');
+  const tag5 = sh.getRange(C5(14) + f + ':' + C5(14) + last);
   cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('WIDE').setFontColor('#137333')
     .setRanges([tag5]).build());
   cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('NARROW').setFontColor('#1A73E8')
@@ -600,8 +642,8 @@ function setupCalc() {
      then ATR = (previous ATR x (N-1) + TR) / N. Rows run oldest -> newest. */
   sh.getRange(f - 2, S6).setValue('STEP 6  -  Daily True Range and ATR(ATR_PERIOD), oldest -> newest')
     .setFontWeight('bold');
-  sh.getRange(f - 1, S6, 1, S6N).setValues([['Session', 'High', 'Low', 'Close', 'True Range',
-    'ATR', 'ATR % of close']]);
+  sh.getRange(f - 1, S6, 1, S6N).setValues([['Session Date', 'Day High', 'Day Low', 'Day Close',
+    'True Range', 'Average True Range (Wilder)', 'Average True Range as % of Close']]);
   const s6 = [];
   for (let r = f; r < f + S6ROWS; r++) {
     const c = function (i) { return C6(i) + r; };
@@ -645,12 +687,13 @@ function setupCalc() {
     sh.getRange(f + i, 1, 1, END).setBackground('#F1F3F4');
   }
   sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
-  sh.setColumnWidth(1, 150);
-  for (let c = 2; c <= END; c++) sh.setColumnWidth(c, 82);
+  sh.setColumnWidth(1, 220);
+  for (let c = 2; c <= END; c++) sh.setColumnWidth(c, 110);
   [S4 - 1, S5 - 1, S6 - 1].forEach(function (c) { sh.setColumnWidth(c, 18); });
   sh.setColumnWidth(14, 18);                /* gaps between the steps */
   sh.setColumnWidth(22, 18);
   for (let c = S3 + 11; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
+  sh.setColumnWidth(5, 250);                /* reference labels sit in column E */
   sh.setFrozenRows(2);
 
   setCalcSymbols_(sh);
