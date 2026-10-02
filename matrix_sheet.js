@@ -216,7 +216,9 @@ function setupCalc() {
     ['RSI_PERIOD', 'RSI period',        14,  'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)'],
     ['OI_EMA',     'OI EMA period',     9,   'EMA of Net / CE / PE change in OI, 10-minute bars  (name: OI_EMA)'],
     ['PX_EMA',     'Price EMA period',  20,  'EMA of the 10-minute PRICE  (name: PX_EMA)'],
-    ['FLAT_BAND',  'Flat band %',       0.1, 'price within this % of its EMA = consolidating  (name: FLAT_BAND)']
+    ['FLAT_BAND',  'Flat band %',       0.1, 'price within this % of its EMA = consolidating  (name: FLAT_BAND)'],
+    ['PIN_BAND',   'Pin band %',        1,   'price within this % of GEX STRIKE = at the pin  (name: PIN_BAND)'],
+    ['GEX_MIN',    'GEX minimum %',     3,   'GEX below this % of the previous day cash volume = too small to matter  (name: GEX_MIN)']
   ];
   const params = [];
   for (let i = 0; i < 7; i++) {
@@ -393,20 +395,69 @@ function setupCalc() {
     cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(c[0]).setFontColor(c[1])
       .setRanges([sh.getRange(tag)]).build());
   });
+
+  /* --- STEP 4: delta-weighted OI and gamma exposure ---------------------- */
+  /* Collector rows, ATM +/-5 of the nearest expiry, all in SHARES:
+     DOI = OI x delta (buyers' side); GEX = OI x gamma x price x 1% = shares a
+     fully hedged writer trades per 1% move. Net GEX here is CALL - PUT (the
+     US convention); which side NSE writers are on is not in the data. */
+  const S4 = S3 + S3N + 1, S4N = 12;
+  const C4 = function (i) { return cl(S4 + i); };
+  sh.getRange(f - 2, S4).setValue('STEP 4  -  Delta-weighted OI (DOI) and gamma exposure (GEX), '
+                                  + 'shares;  pin = GEX STRIKE').setFontWeight('bold');
+  sh.getRange(f - 1, S4, 1, S4N).setValues([['CALL DOI', 'PUT DOI', 'Net DOI', 'Net DOI % of FUT OI',
+    'CALL GEX', 'PUT GEX', 'GEX total', 'Net GEX  CALL-PUT', 'GEX % of prev cash vol',
+    'GEX STRIKE', 'Pin distance %', 'Read']]);
+  const prevCash = 'IFERROR(INDEX(' + "'" + REF_TAB + "'!" + '$D:$D,MATCH($B$2&"|CASH VOL|PrevDay",'
+                   + "'" + REF_TAB + "'!" + '$E:$E,0)),"")';
+  const s4 = [];
+  for (let r = f; r <= last; r++) {
+    const c = function (i) { return C4(i) + r; };
+    s4.push([
+      fixed('CALL DOI', r),
+      fixed('PUT DOI', r),
+      '=IF(OR(' + c(0) + '="",' + c(1) + '=""),"",' + c(0) + '+' + c(1) + ')',
+      '=IF(OR(' + c(2) + '="",N($L' + r + ')=0),"",' + c(2) + '/$L' + r + '*100)',
+      fixed('CALL GEX', r),
+      fixed('PUT GEX', r),
+      '=IF(OR(' + c(4) + '="",' + c(5) + '=""),"",' + c(4) + '+' + c(5) + ')',
+      '=IF(OR(' + c(4) + '="",' + c(5) + '=""),"",' + c(4) + '-' + c(5) + ')',
+      '=IF(OR(' + c(6) + '="",N(' + prevCash + ')=0),"",' + c(6) + '/' + prevCash + '*100)',
+      fixed('GEX STRIKE', r),
+      '=IF(OR($B' + r + '="",N(' + c(9) + ')=0),"",($B' + r + '/' + c(9) + '-1)*100)',
+      '=IF(' + c(8) + '="","",IF(' + c(8) + '<GEX_MIN,"GEX SMALL",'
+        + 'IF(AND(' + c(10) + '<>"",ABS(N(' + c(10) + '))<=PIN_BAND),"AT PIN","")))'
+    ]);
+  }
+  sh.getRange(f, S4, CALC_ROWS, S4N).setFormulas(s4);
+  sh.getRange(f, S4, CALC_ROWS, 3).setNumberFormat('#,##0;-#,##0');
+  sh.getRange(f, S4 + 3, CALC_ROWS, 1).setNumberFormat('0.0');
+  sh.getRange(f, S4 + 4, CALC_ROWS, 4).setNumberFormat('#,##0;-#,##0');
+  sh.getRange(f, S4 + 8, CALC_ROWS, 1).setNumberFormat('0.0');
+  sh.getRange(f, S4 + 9, CALC_ROWS, 1).setNumberFormat('#,##0.##');
+  sh.getRange(f, S4 + 10, CALC_ROWS, 1).setNumberFormat('0.00');
+  sh.getRange(f, S4 + 11, CALC_ROWS, 1).setHorizontalAlignment('center').setFontWeight('bold');
+  const tag4 = sh.getRange(C4(11) + f + ':' + C4(11) + last);
+  cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('AT PIN').setFontColor('#B06000')
+    .setRanges([tag4]).build());
+  cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('GEX SMALL').setFontColor('#5F6368')
+    .setRanges([tag4]).build());
   sh.setConditionalFormatRules(cf);
+  const END = S4 + S4N - 1;
 
   /* --- look -------------------------------------------------------------- */
-  [[f - 1, 1, hdr1.length], [f - 1, 15, 7], [f - 1, S3, S3N]].forEach(function (h) {
+  [[f - 1, 1, hdr1.length], [f - 1, 15, 7], [f - 1, S3, S3N], [f - 1, S4, S4N]].forEach(function (h) {
     sh.getRange(h[0], h[1], 1, h[2]).setFontWeight('bold').setBackground(head)
       .setFontColor('#FFFFFF').setHorizontalAlignment('center').setWrap(true);
   });
   sh.getRange(f, 1, CALC_ROWS, 1).setFontWeight('bold');
   for (let i = 1; i < CALC_ROWS; i += 2) {
-    sh.getRange(f + i, 1, 1, S3 + S3N - 1).setBackground('#F1F3F4');
+    sh.getRange(f + i, 1, 1, END).setBackground('#F1F3F4');
   }
   sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
   sh.setColumnWidth(1, 150);
-  for (let c = 2; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 82);
+  for (let c = 2; c <= END; c++) sh.setColumnWidth(c, 82);
+  sh.setColumnWidth(S4 - 1, 18);
   sh.setColumnWidth(14, 18);                /* gaps between the steps */
   sh.setColumnWidth(22, 18);
   for (let c = S3 + 11; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
