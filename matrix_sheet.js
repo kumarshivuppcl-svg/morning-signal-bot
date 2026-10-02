@@ -30,6 +30,14 @@ const SHEET_ID = 'PASTE_YOUR_SHEET_ID_HERE';
 const REPO = 'kumarshivuppcl-svg/morning-signal-bot';
 const RAW  = 'https://raw.githubusercontent.com/' + REPO + '/master/data/';
 const DATA_TAB = 'TOP15_DATA';
+/* Raw numbers for the CALC page, one row per (stock, metric, time). The
+   MATRIX tab shows text like "1,234 ▲" that formulas cannot use. */
+const LONG_TAB = 'DATA_LONG';
+const REF_TAB  = 'DATA_REF';
+const CALC_TAB = 'CALC';
+const CALC_FIRST = 16, CALC_ROWS = 60;      /* data rows on CALC: 16..75 */
+const CALC_METRICS = ['PRICE', 'VWAP', 'CASH VOL', 'F&O VOL', 'F&O OI', 'CALL VOL',
+                      'CALL OI', 'PUT VOL', 'PUT OI', 'FUT VOL', 'FUT OI', 'FUT PRICE'];
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 
 /* Sheet1 layout: title, live status, legend, header, then 15 data rows. */
@@ -58,7 +66,12 @@ function refreshNow() {
   pullTop_(day);
   ensureSheet1_();
   const res = fetchCsv_(day);
-  if (res) { render_(res, day, 'MATRIX'); return; }
+  if (res) {
+    pullLong_(day, res);           /* raw numbers first: the CALC page reads them */
+    ensureCalc_();
+    render_(res, day, 'MATRIX');
+    return;
+  }
   /* No snapshot yet today (before 9:20, or a holiday): blank MATRIX so an
      old day is never mistaken for today. Sheet1 keeps the last ranking, and
      its title shows which day that was. */
@@ -110,6 +123,212 @@ function pullTop_(day) {
   d.getRange('AB2:AB3').setNumberFormat('dd-mmm-yyyy hh:mm');
   console.log('ranking ' + day + ' snapshot ' + at + ' -> ' + DATA_TAB);
   return true;
+}
+
+
+/* ========================================================= raw numbers ===== */
+
+/* Flatten the matrix CSV (and today's futures CSV, when the PC collector has
+   published one) into DATA_LONG -- Symbol | Metric | Time | Value | Key --
+   and the reference columns (PrevDay, Open, pivots, ...) into DATA_REF.
+   Key = "SYMBOL|METRIC|TIME", so any formula can fetch one number with a
+   single MATCH. Times are stored as TEXT ("09:20"): left as values, Sheets
+   would turn them into time serials and every key lookup would miss. */
+function pullLong_(day, matrixRows) {
+  const longRows = [], refRows = [];
+  const add = function (rows) {
+    if (!rows || rows.length < 2) return;
+    const head = rows[0].map(function (h) { return String(h).trim(); });
+    for (let r = 1; r < rows.length; r++) {
+      const sym = String(rows[r][0] || '').trim(), met = String(rows[r][1] || '').trim();
+      if (!sym || !met) continue;
+      for (let c = 2; c < head.length; c++) {
+        const s = String(rows[r][c] === undefined ? '' : rows[r][c]).trim();
+        if (s === '') continue;
+        const n = Number(s), v = isNaN(n) ? s : n;
+        const key = sym + '|' + met + '|' + head[c];
+        (head[c].indexOf(':') > 0 ? longRows : refRows).push([sym, met, head[c], v, key]);
+      }
+    }
+  };
+  add(matrixRows);
+  const fr = UrlFetchApp.fetch(RAW + 'fut_' + day + '.csv?cb=' + Date.now(),
+                               { muteHttpExceptions: true });
+  if (fr.getResponseCode() === 200) add(Utilities.parseCsv(fr.getContentText()));
+
+  const ss = book_();
+  [[LONG_TAB, longRows], [REF_TAB, refRows]].forEach(function (t) {
+    const sh = ss.getSheetByName(t[0]) || ss.insertSheet(t[0]);
+    sh.clearContents();
+    const rows = [['Symbol', 'Metric', t[0] === LONG_TAB ? 'Time' : 'Field', 'Value', 'Key']]
+                   .concat(t[1]);
+    sh.getRange(1, 1, rows.length, 5).setNumberFormats(
+      rows.map(function () { return ['@', '@', '@', 'General', '@']; }));
+    sh.getRange(1, 1, rows.length, 5).setValues(rows);
+    if (!sh.isSheetHidden()) sh.hideSheet();
+  });
+  console.log(LONG_TAB + ': ' + longRows.length + ' values,  ' + REF_TAB + ': '
+              + refRows.length + ' reference values');
+}
+
+
+/* ================================================================ CALC ===== */
+
+/* One page showing every step for ONE stock. B2 holds the stock; everything
+   else is a formula reading DATA_LONG / DATA_REF and the yellow parameter
+   cells, so changing a parameter recalculates the whole page.
+   Safe to re-run; it rebuilds the page but keeps the chosen stock and any
+   parameter values already typed in. */
+function setupCalc() {
+  const ss = book_();
+  let sh = ss.getSheetByName(CALC_TAB);
+  const keep = {};
+  if (sh) {                                 /* preserve user choices */
+    keep.sym = sh.getRange('B2').getValue();
+    keep.params = sh.getRange('A5:C11').getValues();
+  } else {
+    sh = ss.insertSheet(CALC_TAB);
+  }
+  sh.clear();
+  sh.clearConditionalFormatRules();
+  sh.getRange('A:Z').setFontFamily('Arial').setFontSize(10);
+
+  const top = top1Sheet_(ss);
+  const L = "'" + LONG_TAB + "'!", R = "'" + REF_TAB + "'!";
+  const yellow = '#FFF2CC', head = '#1F3864';
+
+  /* --- title, stock, back link ------------------------------------------ */
+  sh.getRange('A1').setFormula('="STEP-BY-STEP CALCULATIONS    "&IF($B$2="","(pick a stock)",$B$2)')
+    .setFontSize(13).setFontWeight('bold');
+  sh.getRange('A2').setValue('Stock').setFontWeight('bold');
+  sh.getRange('B2').setValue(keep.sym || '').setBackground(yellow).setFontWeight('bold')
+    .setBorder(true, true, true, true, false, false);
+  sh.getRange('C2').setValue('click a stock name on TOP 15 or MATRIX, or pick from the list')
+    .setFontColor('#5F6368').setFontSize(9);
+  sh.getRange('H2').setFormula('=HYPERLINK("#gid=' + top.getSheetId() + '","<- back to TOP 15")');
+
+  /* --- parameters --------------------------------------------------------- */
+  sh.getRange('A4').setValue('PARAMETERS  -  edit the yellow cells; every formula below reads them')
+    .setFontWeight('bold');
+  const params = keep.params || [['RSI period', 14, 'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)']];
+  if (!keep.params) {
+    for (let i = 1; i < 7; i++) params.push(['', '', '']);
+  }
+  sh.getRange('A5:C11').setValues(params);
+  sh.getRange('B5:B11').setBackground(yellow).setHorizontalAlignment('center');
+  sh.getRange('C5:C11').setFontColor('#5F6368').setFontSize(9);
+  ss.setNamedRange('RSI_PERIOD', sh.getRange('B5'));
+
+  /* --- reference values --------------------------------------------------- */
+  const ref = function (metric, field) {
+    return '=IFERROR(INDEX(' + R + '$D:$D,MATCH($B$2&"|' + metric + '|' + field + '",'
+           + R + '$E:$E,0)),"")';
+  };
+  sh.getRange('E4').setValue('REFERENCE  (yesterday and today\'s open)').setFontWeight('bold');
+  const refs = [
+    ['Prev close',               ref('PRICE', 'PrevDay'),     ''],
+    ['Close day before',         ref('PRICE', 'PrevDay2'),    ''],
+    ['Today open',               ref('PRICE', 'Open'),        ''],
+    ['Daily CPR  top / bottom',  ref('PRICE', 'dTC'),         ref('PRICE', 'dBC')],
+    ['Weekly CPR  top / bottom', ref('PRICE', 'wTC'),         ref('PRICE', 'wBC')],
+    ['Cash vol  prev / before',  ref('CASH VOL', 'PrevDay'),  ref('CASH VOL', 'PrevDay2')],
+    ['Delivery %  prev / before', ref('CASH VOL', 'DelivPct'), ref('CASH VOL', 'DelivPctPrev')],
+    ['Futures  vol / OI  prev',  ref('FUT VOL', 'PrevDay'),   ref('FUT OI', 'PrevDay')]
+  ];
+  refs.forEach(function (row, i) {
+    sh.getRange(5 + i, 5).setValue(row[0]);
+    sh.getRange(5 + i, 6).setFormula(row[1]);
+    if (row[2]) sh.getRange(5 + i, 7).setFormula(row[2]);
+  });
+  sh.getRange('F5:G12').setNumberFormat('#,##0.00').setHorizontalAlignment('right');
+
+  /* --- STEP 1: raw inputs, one row per 10-minute snapshot ----------------- */
+  const f = CALC_FIRST, last = CALC_FIRST + CALC_ROWS - 1;
+  sh.getRange(f - 2, 1).setValue('STEP 1  -  Raw inputs for this stock, every 10 minutes '
+                                 + '(absolute numbers from NSE / Breeze)').setFontWeight('bold');
+  const hdr1 = ['Time'].concat(CALC_METRICS);
+  sh.getRange(f - 1, 1, 1, hdr1.length).setValues([hdr1]);
+  /* (cond)*(cond) form: same result in Sheets and in Excel if downloaded */
+  sh.getRange(f, 1).setFormula('=IFERROR(FILTER(' + L + '$C:$C,(' + L + '$A:$A=$B$2)*('
+                               + L + '$B:$B="PRICE")),"")');
+  const raw = [];
+  for (let r = f; r <= last; r++) {
+    const line = [];
+    for (let c = 2; c <= hdr1.length; c++) {
+      const col = String.fromCharCode(64 + c);
+      line.push('=IF($A' + r + '="","",IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|"&' + col
+                + '$' + (f - 1) + '&"|"&$A' + r + ',' + L + '$E:$E,0)),""))');
+    }
+    raw.push(line);
+  }
+  sh.getRange(f, 2, CALC_ROWS, hdr1.length - 1).setFormulas(raw).setNumberFormat('#,##0.##');
+
+  /* --- STEP 2: worked example, RSI on the 10-minute price ----------------- */
+  /* Columns O..U. Wilder: first average = simple mean of the first N moves,
+     then avg = (previous avg x (N-1) + this move) / N. N is RSI_PERIOD. */
+  sh.getRange(f - 2, 15).setValue('STEP 2  -  Example: RSI(RSI_PERIOD) on the 10-minute PRICE '
+                                  + '(change B5 and watch it recalculate)').setFontWeight('bold');
+  sh.getRange(f - 1, 15, 1, 7).setValues([['Change', 'Gain', 'Loss', 'Avg gain',
+                                           'Avg loss', 'RS', 'RSI']]);
+  const rsi = [];
+  for (let r = f; r <= last; r++) {
+    const n = 'ROW()-' + f;                  /* moves seen so far at this row */
+    if (r === f) { rsi.push(['', '', '', '', '', '', '']); continue; }
+    const avg = function (src, me) {
+      return '=IF($A' + r + '="","",IF(' + n + '<RSI_PERIOD,"",IF(' + n + '=RSI_PERIOD,'
+        + 'AVERAGE(OFFSET($' + src + '$' + (f + 1) + ',0,0,RSI_PERIOD,1)),'
+        + 'IF(' + src + r + '="",' + me + (r - 1) + ',(' + me + (r - 1)
+        + '*(RSI_PERIOD-1)+' + src + r + ')/RSI_PERIOD))))';
+    };
+    rsi.push([
+      '=IF(OR($B' + r + '="",$B' + (r - 1) + '=""),"",$B' + r + '-$B' + (r - 1) + ')',
+      '=IF(O' + r + '="","",MAX(O' + r + ',0))',
+      '=IF(O' + r + '="","",MAX(-O' + r + ',0))',
+      avg('P', 'R'),
+      avg('Q', 'S'),
+      '=IF(OR(R' + r + '="",S' + r + '=""),"",IF(S' + r + '=0,"",R' + r + '/S' + r + '))',
+      '=IF(OR(R' + r + '="",S' + r + '=""),"",IF(S' + r + '=0,100,100-100/(1+R' + r + '/S' + r + ')))'
+    ]);
+  }
+  sh.getRange(f, 15, CALC_ROWS, 7).setFormulas(rsi).setNumberFormat('0.00');
+
+  /* --- look -------------------------------------------------------------- */
+  [[f - 1, 1, hdr1.length], [f - 1, 15, 7]].forEach(function (h) {
+    sh.getRange(h[0], h[1], 1, h[2]).setFontWeight('bold').setBackground(head)
+      .setFontColor('#FFFFFF').setHorizontalAlignment('center').setWrap(true);
+  });
+  sh.getRange(f, 1, CALC_ROWS, 1).setFontWeight('bold');
+  for (let i = 1; i < CALC_ROWS; i += 2) {
+    sh.getRange(f + i, 1, 1, 21).setBackground('#F1F3F4');
+  }
+  sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
+  sh.setColumnWidth(1, 150);
+  for (let c = 2; c <= 21; c++) sh.setColumnWidth(c, 82);
+  sh.setColumnWidth(14, 18);                /* gap between the two steps */
+  sh.setFrozenRows(2);
+
+  setCalcSymbols_(sh);
+  console.log('CALC built: 1 parameter, ' + refs.length + ' reference values, '
+              + CALC_METRICS.length + ' raw columns, RSI example');
+}
+
+/* Dropdown of every stock, so the page works even without the click script. */
+function setCalcSymbols_(sh) {
+  const ref = book_().getSheetByName(REF_TAB);
+  if (!ref || ref.getLastRow() < 2) return;
+  const seen = {}, list = [];
+  ref.getRange(2, 1, ref.getLastRow() - 1, 1).getValues().forEach(function (r) {
+    const s = String(r[0]).trim();
+    if (s && !seen[s]) { seen[s] = 1; list.push(s); }
+  });
+  list.sort();
+  sh.getRange('B2').setDataValidation(SpreadsheetApp.newDataValidation()
+    .requireValueInList(list.slice(0, 500), true).setAllowInvalid(true).build());
+}
+
+function ensureCalc_() {
+  const sh = book_().getSheetByName(CALC_TAB);
+  if (!sh || sh.getRange(CALC_FIRST, 1).getFormula().indexOf(LONG_TAB) < 0) setupCalc();
 }
 
 
@@ -166,7 +385,8 @@ function setupSheet1() {
     .setFontSize(10);
 
   sh.getRange('A3').setValue(
-    'GAP% open vs prev close · OPEN% now vs today\'s open · CHG% now vs prev close'
+    'Click a stock name to open its step-by-step calculations (CALC tab)   |   '
+    + 'GAP% open vs prev close · OPEN% now vs today\'s open · CHG% now vs prev close'
     + '   |   BUILD = whole day, SESSION = since the open, bold where they disagree'
     + '   |   vs VWAP +above / -below   |   dCPR/wCPR price vs daily/weekly pivot range,'
     + ' CPR w% its width (bold = narrow, trending-day setup)')
@@ -191,7 +411,9 @@ function setupSheet1() {
                 14: '0.00', 15: '0.0' };
   Object.keys(fmt).forEach(function (c) { R(Number(c)).setNumberFormat(fmt[c]); });
   sh.getRange(TOP_FIRST, 1, n, hdr.length).setFontFamily('Roboto Mono').setFontSize(10);
-  R(2).setFontWeight('bold');
+  /* Looks like a link: clicking it opens that stock's CALC page (needs the
+     small click script attached to the sheet -- calc_click.gs). */
+  R(2).setFontWeight('bold').setFontColor('#1155CC').setFontLine('underline');
   /* Zebra shading is plain formatting, not a rule: in Sheets only the first
      matching rule applies to a cell, so a shading rule would block the colours. */
   for (let i = 0; i < n; i += 2) {
