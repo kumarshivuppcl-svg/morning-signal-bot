@@ -155,6 +155,18 @@ function pullLong_(day, matrixRows) {
   /* The data's own date, so CALC counts days to expiry from the snapshot
      day rather than from whenever the sheet is opened. */
   refRows.push(['_ALL', 'DAY', 'Date', day, '_ALL|DAY|Date']);
+  /* NSE F&O holidays (saved by the collector), as real dates so NETWORKDAYS
+     can skip them when counting trading days to expiry. */
+  const hr = UrlFetchApp.fetch(RAW + 'holidays.csv?cb=' + Date.now(), { muteHttpExceptions: true });
+  if (hr.getResponseCode() === 200) {
+    Utilities.parseCsv(hr.getContentText()).slice(1).forEach(function (h) {
+      const iso = String(h[0] || '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
+        refRows.push(['_ALL', 'HOLIDAY', iso,
+                      Utilities.parseDate(iso, 'Asia/Kolkata', 'yyyy-MM-dd'), '_ALL|HOLIDAY|' + iso]);
+      }
+    });
+  }
   const fr = UrlFetchApp.fetch(RAW + 'fut_' + day + '.csv?cb=' + Date.now(),
                                { muteHttpExceptions: true });
   if (fr.getResponseCode() === 200) add(Utilities.parseCsv(fr.getContentText()));
@@ -438,10 +450,11 @@ function setupCalc() {
       /* calendar days from the snapshot day; 0 on expiry day */
       '=IF(OR(' + c(12) + '="",' + dataDay + '=""),"",IFERROR(' + asDate(c(12)) + '-'
         + asDate(dataDay) + ',""))',
-      /* sessions after today up to and including expiry (weekends excluded,
-         exchange holidays not) */
+      /* sessions after today up to and including expiry: weekends and NSE
+         F&O holidays excluded (falls back to weekends only if no list) */
       '=IF(' + c(13) + '="","",IFERROR(NETWORKDAYS(' + asDate(dataDay) + ',' + asDate(c(12))
-        + ')-1,""))'
+        + ',FILTER(' + "'" + REF_TAB + "'!" + '$D:$D,' + "'" + REF_TAB + "'!" + '$B:$B="HOLIDAY"))-1,'
+        + 'IFERROR(NETWORKDAYS(' + asDate(dataDay) + ',' + asDate(c(12)) + ')-1,"")))'
     ]);
   }
   sh.getRange(f, S4, CALC_ROWS, S4N).setFormulas(s4);

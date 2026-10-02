@@ -697,6 +697,37 @@ def prev_opt_vol(pf, expiry, strikes, ck="ce", pk="pe"):
     return cv, pv, cover, True
 
 
+def refresh_holidays(day):
+    """NSE's F&O trading holidays -> data/holidays.csv (date,description,fetched).
+
+    Fetched at most once a day: the file records when it was fetched, because
+    a fresh checkout gives every file the same mtime. On failure the existing
+    file is kept -- a stale list beats none for counting trading days."""
+    p = os.path.join(DATA_D, "holidays.csv")
+    try:
+        if pd.read_csv(p, dtype=str)["fetched"].iloc[0] == day:
+            return
+    except Exception:
+        pass
+    try:
+        from curl_cffi import requests as cffi
+        s = cffi.Session(impersonate="chrome")
+        ref = "https://www.nseindia.com/resources/exchange-communication-holidays"
+        s.get(ref, timeout=15)
+        fo = s.get("https://www.nseindia.com/api/holiday-master?type=trading",
+                   headers={"Referer": ref, "Accept": "application/json"},
+                   timeout=20).json().get("FO", [])
+        rows = sorted({(datetime.strptime(h["tradingDate"], "%d-%b-%Y").strftime("%Y-%m-%d"),
+                        str(h.get("description", "")).strip()) for h in fo})
+        if not rows:
+            raise ValueError("empty FO holiday list")
+        pd.DataFrame([{"date": d, "description": t, "fetched": day} for d, t in rows]
+                     ).to_csv(p, index=False)
+        print(f"  holidays: {len(rows)} F&O holidays saved")
+    except Exception as e:
+        print(f"  holidays: fetch failed ({type(e).__name__}), keeping existing file")
+
+
 def _blank(v):
     """True when a cell is genuinely empty (handles pandas NaN -> 'nan')."""
     t = str(v).strip().lower()
@@ -759,6 +790,7 @@ def main():
 
     syms = universe()
     print(f"universe {len(syms)}")
+    refresh_holidays(day)
 
     df = load_or_init(day, syms)
     key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
