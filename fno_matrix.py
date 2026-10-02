@@ -50,7 +50,7 @@ Note for the renderer: cumulative rows only ever rise, so a cell-vs-cell arrow
 on them is always up and says nothing. Draw arrows on the derived ratio or on
 the per-interval increment instead.
 """
-import os, sys, csv, time
+import os, sys, csv, time, math
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -82,9 +82,14 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # same instant rather than a prior session, so nothing is hidden by the
 # division, and the percentage is the form the cost question is actually asked
 # in -- an edge either clears the spread or it does not.
+# CALL/PUT DOI are delta-weighted OI and CALL/PUT GEX gamma exposure over the
+# same ATM +/-5 band, both in SHARES (see _greeks). DOI = the share position
+# that the open options are equivalent to; GEX = shares a fully hedged writer
+# must trade for each 1% move. GEX STRIKE = strike holding the most gamma.
 METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI",
-            "CALL SPRD", "PUT SPRD"]
+            "CALL SPRD", "PUT SPRD",
+            "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE"]
 # dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
 # on the PRICE row. They are fixed for the whole day (and week), so they are
 # fetched once and left alone -- see pivot_range().
@@ -345,6 +350,88 @@ def _iso_expiry(e):
         return ""
 
 
+# The rate and clock NSE itself uses for the chain's impliedVolatility: with
+# r = 10% and time measured from the chain's timestamp, Black-Scholes on NSE's
+# IV reproduces NSE's last prices to 0.02% (BAJAJ-AUTO, HDFCBANK, RVNL,
+# 2026-10-01). Any other pair puts delta on a different model from the IV.
+RATE = 0.10
+
+
+def _ncdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _npdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _greeks(rows, spot, expiry, stamp=""):
+    """Delta-weighted OI and gamma exposure over the strike band `rows`.
+
+    Each leg uses NSE's own implied volatility for that strike. A leg with no
+    IV (untraded) borrows the other leg's at the same strike, else the nearest
+    strike's on its own side; a band with no IV at all returns None.
+
+    Returned in CONTRACTS -- the caller multiplies by the lot size:
+      call_doi  sum CE OI x call delta           (> 0)
+      put_doi   sum PE OI x put delta            (< 0)
+      call_gex  sum CE OI x gamma x S x 1%       shares of hedge per 1% move
+      put_gex   sum PE OI x gamma x S x 1%       (both positive: which side is
+                                                  hedging is not in NSE data)
+      gex_k     strike holding the most gamma (CE + PE): the likely pin."""
+    try:
+        exp = datetime.strptime(expiry, "%d-%b-%Y").replace(
+            hour=15, minute=30, tzinfo=IST)
+    except Exception:
+        return None
+    try:
+        asof = datetime.strptime(stamp, "%d-%b-%Y %H:%M:%S").replace(tzinfo=IST)
+    except Exception:
+        asof = _now()
+    t = max((exp - asof).total_seconds(), 1800) / (365 * 86400.0)
+    ks = [float(z.get("strikePrice", 0) or 0) for z in rows]
+    iv = {"CE": [], "PE": []}
+    for z in rows:
+        for side in ("CE", "PE"):
+            v = float((z.get(side) or {}).get("impliedVolatility", 0) or 0)
+            iv[side].append(v if v > 0 else None)
+    for side, other in (("CE", "PE"), ("PE", "CE")):
+        for i, v in enumerate(iv[side]):
+            if v is None and iv[other][i]:
+                iv[side][i] = -iv[other][i]           # borrowed; sign marks it
+    for side in ("CE", "PE"):
+        have = [i for i, v in enumerate(iv[side]) if v]
+        if not have:
+            return None
+        iv[side] = [abs(v) if v else abs(iv[side][min(have, key=lambda j: abs(j - i))])
+                    for i, v in enumerate(iv[side])]
+
+    out = {"call_doi": 0.0, "put_doi": 0.0, "call_gex": 0.0, "put_gex": 0.0}
+    best, gex_k = -1.0, ""
+    for i, z in enumerate(rows):
+        k, here = ks[i], 0.0
+        if k <= 0:
+            continue
+        for side in ("CE", "PE"):
+            oi = float((z.get(side) or {}).get("openInterest", 0) or 0)
+            sig = iv[side][i] / 100.0
+            d1 = ((math.log(spot / k) + (RATE + sig * sig / 2) * t)
+                  / (sig * math.sqrt(t)))
+            gam = _npdf(d1) / (spot * sig * math.sqrt(t))
+            g = oi * gam * spot * 0.01
+            here += g
+            if side == "CE":
+                out["call_doi"] += oi * _ncdf(d1)
+                out["call_gex"] += g
+            else:
+                out["put_doi"] += oi * (_ncdf(d1) - 1.0)
+                out["put_gex"] += g
+        if here > best:
+            best, gex_k = here, k
+    out["gex_k"] = gex_k
+    return out
+
+
 def option_data(symbols):
     """{sym: {'call_vol','call_oi','put_vol','put_oi'}} over ATM +/-5 strikes."""
     sessions = [_chain_session() for _ in range(WORKERS)]
@@ -392,9 +479,12 @@ def option_data(symbols):
             # the cost hurdle any options signal has to clear: on a mid-cap
             # name a round trip can eat several percent of premium, which is
             # larger than most edges. Measuring it beats assuming it.
+            # option-chain-v3 names the best quotes buyPrice1/sellPrice1; the
+            # old bidprice/askPrice keys are gone, which left every spread
+            # cell blank until 2026-10-02.
             def _spread(leg):
-                b = float(leg.get("bidprice", 0) or 0)
-                a = float(leg.get("askPrice", 0) or 0)
+                b = float(leg.get("buyPrice1", leg.get("bidprice", 0)) or 0)
+                a = float(leg.get("sellPrice1", leg.get("askPrice", 0)) or 0)
                 mid = (a + b) / 2.0
                 if b <= 0 or a <= 0 or mid <= 0 or a < b:
                     return ""          # no two-sided quote (closed, or illiquid)
@@ -411,6 +501,7 @@ def option_data(symbols):
                          "put_vol": pv, "put_oi": po,
                          "call_prev_oi": c_prev, "put_prev_oi": p_prev,
                          "call_sprd": c_sp, "put_sprd": p_sp,
+                         "greeks": _greeks(sel, spot, exps[0], rec.get("timestamp", "")),
                          "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
         except Exception:
             return sym, None
@@ -503,6 +594,7 @@ def prev_fno_volumes(days=1):
                         "ceoi": {k: v / L for k, v in ceo.get(sym, {}).items()},
                         "peoi": {k: v / L for k, v in peo.get(sym, {}).items()},
                         "spot": spot.get(sym, 0.0),
+                        "lot": lot.get(sym, 0.0),
                         "tot_vol": tv.get(sym, 0.0),
                         "tot_oi":  toi.get(sym, 0.0) / L}
         return out
@@ -750,6 +842,16 @@ def main():
                 put(s, "CALL SPRD", o["call_sprd"])
             if o.get("put_sprd") != "":
                 put(s, "PUT SPRD", o["put_sprd"])
+            # Contracts -> shares with the bhavcopy lot size, so these sit in
+            # the same unit as CASH VOL and FUT OI.
+            gk, lot_ = o.get("greeks"), (f1.get(s) or {}).get("lot", 0)
+            if gk and lot_ > 0:
+                put(s, "CALL DOI", int(round(gk["call_doi"] * lot_)))
+                put(s, "PUT DOI",  int(round(gk["put_doi"] * lot_)))
+                put(s, "CALL GEX", int(round(gk["call_gex"] * lot_)))
+                put(s, "PUT GEX",  int(round(gk["put_gex"] * lot_)))
+                if gk["gex_k"] != "":
+                    put(s, "GEX STRIKE", gk["gex_k"])
             # Yesterday's OI comes free with the chain: openInterest minus
             # changeinOpenInterest. Verified exact against the bhavcopy.
             if o.get("call_prev_oi"):

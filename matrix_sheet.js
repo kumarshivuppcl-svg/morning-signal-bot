@@ -35,7 +35,9 @@ const DATA_TAB = 'TOP15_DATA';
 const LONG_TAB = 'DATA_LONG';
 const REF_TAB  = 'DATA_REF';
 const CALC_TAB = 'CALC';
-const CALC_HDR_ROW = 13;                    /* CALC: times on row 13, one indicator per row below */
+const CALC_FIRST = 16, CALC_ROWS = 60;      /* data rows on CALC: 16..75 */
+const CALC_METRICS = ['PRICE', 'VWAP', 'CASH VOL', 'F&O VOL', 'F&O OI', 'CALL VOL',
+                      'CALL OI', 'PUT VOL', 'PUT OI', 'FUT VOL', 'FUT OI', 'FUT PRICE'];
 const UP = ' ▲', DOWN = ' ▼', FLAT = '';
 
 /* Sheet1 layout: title, live status, legend, header, then 15 data rows. */
@@ -192,7 +194,7 @@ function setupCalc() {
   sh.getRange('A:Z').setFontFamily('Arial').setFontSize(10);
 
   const top = top1Sheet_(ss);
-  const L = "'" + LONG_TAB + "'!";
+  const L = "'" + LONG_TAB + "'!", R = "'" + REF_TAB + "'!";
   const yellow = '#FFF2CC', head = '#1F3864';
 
   /* --- title, stock, back link ------------------------------------------ */
@@ -217,41 +219,97 @@ function setupCalc() {
   sh.getRange('C5:C11').setFontColor('#5F6368').setFontSize(9);
   ss.setNamedRange('RSI_PERIOD', sh.getRange('B5'));
 
-  /* --- one row per indicator, snapshot times across (like MATRIX) -------- */
-  /* (cond)*(cond) FILTER form: same result in Sheets and in Excel if downloaded */
-  const pick = function (col) {
-    return 'FILTER(' + L + '$' + col + ':$' + col + ',(' + L + '$A:$A=$B$2)*('
-           + L + '$B:$B="PRICE"))';
+  /* --- reference values --------------------------------------------------- */
+  const ref = function (metric, field) {
+    return '=IFERROR(INDEX(' + R + '$D:$D,MATCH($B$2&"|' + metric + '|' + field + '",'
+           + R + '$E:$E,0)),"")';
   };
-  const h = CALC_HDR_ROW;
-  sh.getRange(h, 1).setValue('Time');
-  sh.getRange(h, 2).setFormula('=IFERROR(TRANSPOSE(' + pick('C') + '),"")');
-  sh.getRange(h + 1, 1).setFormula('="RSI ("&RSI_PERIOD&")"');
-  /* Wilder RSI on the 10-minute PRICE, N = RSI_PERIOD:
-     first average = simple mean of the first N moves, then
-     avg = (previous avg x (N-1) + this move) / N;  RSI = 100 - 100/(1+avgGain/avgLoss). */
-  sh.getRange(h + 1, 2).setFormula('=IFERROR(LET(px,' + pick('D') + ',per,RSI_PERIOD,'
-    + 'idx,SEQUENCE(ROWS(px)),'
-    + 'gain,MAP(idx,LAMBDA(k,IF(k=1,0,MAX(INDEX(px,k)-INDEX(px,k-1),0)))),'
-    + 'loss,MAP(idx,LAMBDA(k,IF(k=1,0,MAX(INDEX(px,k-1)-INDEX(px,k),0)))),'
-    + 'avgG,SCAN(0,idx,LAMBDA(a,k,IF(k<=per,0,IF(k=per+1,SUMPRODUCT((idx<=per+1)*gain)/per,'
-    + '(a*(per-1)+INDEX(gain,k))/per)))),'
-    + 'avgL,SCAN(0,idx,LAMBDA(a,k,IF(k<=per,0,IF(k=per+1,SUMPRODUCT((idx<=per+1)*loss)/per,'
-    + '(a*(per-1)+INDEX(loss,k))/per)))),'
-    + 'TRANSPOSE(MAP(idx,avgG,avgL,LAMBDA(k,g,l,IF(k<=per,"",IF(l=0,100,100-100/(1+g/l))))))),"")');
+  sh.getRange('E4').setValue('REFERENCE  (yesterday and today\'s open)').setFontWeight('bold');
+  const refs = [
+    ['Prev close',               ref('PRICE', 'PrevDay'),     ''],
+    ['Close day before',         ref('PRICE', 'PrevDay2'),    ''],
+    ['Today open',               ref('PRICE', 'Open'),        ''],
+    ['Daily CPR  top / bottom',  ref('PRICE', 'dTC'),         ref('PRICE', 'dBC')],
+    ['Weekly CPR  top / bottom', ref('PRICE', 'wTC'),         ref('PRICE', 'wBC')],
+    ['Cash vol  prev / before',  ref('CASH VOL', 'PrevDay'),  ref('CASH VOL', 'PrevDay2')],
+    ['Delivery %  prev / before', ref('CASH VOL', 'DelivPct'), ref('CASH VOL', 'DelivPctPrev')],
+    ['Futures  vol / OI  prev',  ref('FUT VOL', 'PrevDay'),   ref('FUT OI', 'PrevDay')]
+  ];
+  refs.forEach(function (row, i) {
+    sh.getRange(5 + i, 5).setValue(row[0]);
+    sh.getRange(5 + i, 6).setFormula(row[1]);
+    if (row[2]) sh.getRange(5 + i, 7).setFormula(row[2]);
+  });
+  sh.getRange('F5:G12').setNumberFormat('#,##0.00').setHorizontalAlignment('right');
+
+  /* --- STEP 1: raw inputs, one row per 10-minute snapshot ----------------- */
+  const f = CALC_FIRST, last = CALC_FIRST + CALC_ROWS - 1;
+  sh.getRange(f - 2, 1).setValue('STEP 1  -  Raw inputs for this stock, every 10 minutes '
+                                 + '(absolute numbers from NSE / Breeze)').setFontWeight('bold');
+  const hdr1 = ['Time'].concat(CALC_METRICS);
+  sh.getRange(f - 1, 1, 1, hdr1.length).setValues([hdr1]);
+  /* (cond)*(cond) form: same result in Sheets and in Excel if downloaded */
+  sh.getRange(f, 1).setFormula('=IFERROR(FILTER(' + L + '$C:$C,(' + L + '$A:$A=$B$2)*('
+                               + L + '$B:$B="PRICE")),"")');
+  const raw = [];
+  for (let r = f; r <= last; r++) {
+    const line = [];
+    for (let c = 2; c <= hdr1.length; c++) {
+      const col = String.fromCharCode(64 + c);
+      line.push('=IF($A' + r + '="","",IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|"&' + col
+                + '$' + (f - 1) + '&"|"&$A' + r + ',' + L + '$E:$E,0)),""))');
+    }
+    raw.push(line);
+  }
+  sh.getRange(f, 2, CALC_ROWS, hdr1.length - 1).setFormulas(raw).setNumberFormat('#,##0.##');
+
+  /* --- STEP 2: worked example, RSI on the 10-minute price ----------------- */
+  /* Columns O..U. Wilder: first average = simple mean of the first N moves,
+     then avg = (previous avg x (N-1) + this move) / N. N is RSI_PERIOD. */
+  sh.getRange(f - 2, 15).setValue('STEP 2  -  Example: RSI(RSI_PERIOD) on the 10-minute PRICE '
+                                  + '(change B5 and watch it recalculate)').setFontWeight('bold');
+  sh.getRange(f - 1, 15, 1, 7).setValues([['Change', 'Gain', 'Loss', 'Avg gain',
+                                           'Avg loss', 'RS', 'RSI']]);
+  const rsi = [];
+  for (let r = f; r <= last; r++) {
+    const n = 'ROW()-' + f;                  /* moves seen so far at this row */
+    if (r === f) { rsi.push(['', '', '', '', '', '', '']); continue; }
+    const avg = function (src, me) {
+      return '=IF($A' + r + '="","",IF(' + n + '<RSI_PERIOD,"",IF(' + n + '=RSI_PERIOD,'
+        + 'AVERAGE(OFFSET($' + src + '$' + (f + 1) + ',0,0,RSI_PERIOD,1)),'
+        + 'IF(' + src + r + '="",' + me + (r - 1) + ',(' + me + (r - 1)
+        + '*(RSI_PERIOD-1)+' + src + r + ')/RSI_PERIOD))))';
+    };
+    rsi.push([
+      '=IF(OR($B' + r + '="",$B' + (r - 1) + '=""),"",$B' + r + '-$B' + (r - 1) + ')',
+      '=IF(O' + r + '="","",MAX(O' + r + ',0))',
+      '=IF(O' + r + '="","",MAX(-O' + r + ',0))',
+      avg('P', 'R'),
+      avg('Q', 'S'),
+      '=IF(OR(R' + r + '="",S' + r + '=""),"",IF(S' + r + '=0,"",R' + r + '/S' + r + '))',
+      '=IF(OR(R' + r + '="",S' + r + '=""),"",IF(S' + r + '=0,100,100-100/(1+R' + r + '/S' + r + ')))'
+    ]);
+  }
+  sh.getRange(f, 15, CALC_ROWS, 7).setFormulas(rsi).setNumberFormat('0.00');
 
   /* --- look -------------------------------------------------------------- */
-  sh.getRange(h, 1, 1, 60).setFontWeight('bold').setBackground(head).setFontColor('#FFFFFF')
-    .setHorizontalAlignment('center');
-  sh.getRange(h + 1, 1).setFontWeight('bold');
-  sh.getRange(h + 1, 2, 1, 59).setNumberFormat('0.00').setHorizontalAlignment('center');
+  [[f - 1, 1, hdr1.length], [f - 1, 15, 7]].forEach(function (h) {
+    sh.getRange(h[0], h[1], 1, h[2]).setFontWeight('bold').setBackground(head)
+      .setFontColor('#FFFFFF').setHorizontalAlignment('center').setWrap(true);
+  });
+  sh.getRange(f, 1, CALC_ROWS, 1).setFontWeight('bold');
+  for (let i = 1; i < CALC_ROWS; i += 2) {
+    sh.getRange(f + i, 1, 1, 21).setBackground('#F1F3F4');
+  }
+  sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
   sh.setColumnWidth(1, 150);
-  for (let c = 2; c <= 60; c++) sh.setColumnWidth(c, 56);
+  for (let c = 2; c <= 21; c++) sh.setColumnWidth(c, 82);
+  sh.setColumnWidth(14, 18);                /* gap between the two steps */
   sh.setFrozenRows(2);
-  sh.setFrozenColumns(1);
 
   setCalcSymbols_(sh);
-  console.log('CALC built: RSI row (period in B5)');
+  console.log('CALC built: 1 parameter, ' + refs.length + ' reference values, '
+              + CALC_METRICS.length + ' raw columns, RSI example');
 }
 
 /* Dropdown of every stock, so the page works even without the click script. */
@@ -270,7 +328,7 @@ function setCalcSymbols_(sh) {
 
 function ensureCalc_() {
   const sh = book_().getSheetByName(CALC_TAB);
-  if (!sh || sh.getRange(CALC_HDR_ROW + 1, 2).getFormula().indexOf('SCAN') < 0) setupCalc();
+  if (!sh || sh.getRange(CALC_FIRST, 1).getFormula().indexOf(LONG_TAB) < 0) setupCalc();
 }
 
 
