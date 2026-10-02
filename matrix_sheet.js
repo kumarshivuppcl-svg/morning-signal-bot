@@ -80,6 +80,26 @@ function refreshNow() {
 
 /* Redraw without waiting for the trigger. */
 function pullOnly() { refreshNow(); }
+
+/* Weekends and holidays: load the most recent trading day that has data into
+   TOP 15, MATRIX and CALC (refreshNow deliberately loads only TODAY). Run it
+   by hand; the 10-minute trigger keeps calling refreshNow. */
+function showLastDay() {
+  const t = new Date();
+  for (let i = 0; i < 10; i++) {
+    const d = Utilities.formatDate(new Date(t.getTime() - i * 86400000), 'Asia/Kolkata', 'yyyy-MM-dd');
+    const res = fetchCsv_(d);
+    if (!res) continue;
+    pullTop_(d);
+    ensureSheet1_();
+    pullLong_(d, res);
+    ensureCalc_();
+    render_(res, d, 'MATRIX');
+    console.log('showing ' + d);
+    return;
+  }
+  console.log('no data in the last 10 days');
+}
 function topOnly()  { pullTop_(istToday()); ensureSheet1_(); }
 
 /* Copy today's ranking CSV into TOP15_DATA. On any failure the previous data
@@ -666,8 +686,16 @@ function setupSheet1() {
   const ss = book_();
   /* NOW() must count in IST, and recalculate every minute so the age of the
      data keeps moving even when no refresh happens. */
-  ss.setSpreadsheetTimeZone('Asia/Kolkata');
-  ss.setRecalculationInterval(SpreadsheetApp.RecalculationInterval.ON_CHANGE_AND_MINUTE);
+  /* Both are conveniences, not requirements, and Google sometimes refuses
+     them ("Unexpected error while getting the method ... setRecalculation-
+     Interval") -- so a refusal must not stop the build. The manual route is
+     File > Settings: time zone (GMT+05:30) India, and Calculation >
+     "On change and every minute". */
+  try { ss.setSpreadsheetTimeZone('Asia/Kolkata'); }
+  catch (e) { console.log('time zone not set (' + e.message + ') - set it in File > Settings'); }
+  try { ss.setRecalculationInterval(SpreadsheetApp.RecalculationInterval.ON_CHANGE_AND_MINUTE); }
+  catch (e) { console.log('recalculation not set (' + e.message + ') - File > Settings > '
+                          + 'Calculation > On change and every minute'); }
   if (!ss.getSheetByName(DATA_TAB)) ss.insertSheet(DATA_TAB);
 
   const sh = top1Sheet_(ss);
