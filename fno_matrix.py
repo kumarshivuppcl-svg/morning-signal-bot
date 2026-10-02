@@ -82,13 +82,15 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # same instant rather than a prior session, so nothing is hidden by the
 # division, and the percentage is the form the cost question is actually asked
 # in -- an edge either clears the spread or it does not.
+# CALL/PUT OI FIX: OI over ATM +/-5 around YESTERDAY'S close, fixed for the
+# day, so the 10-minute change is not polluted by the band moving with spot.
 # CALL/PUT DOI are delta-weighted OI and CALL/PUT GEX gamma exposure over the
 # same ATM +/-5 band, both in SHARES (see _greeks). DOI = the share position
 # that the open options are equivalent to; GEX = shares a fully hedged writer
 # must trade for each 1% move. GEX STRIKE = strike holding the most gamma.
 METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI",
-            "CALL SPRD", "PUT SPRD",
+            "CALL SPRD", "PUT SPRD", "CALL OI FIX", "PUT OI FIX",
             "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE"]
 # dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
 # on the PRICE row. They are fixed for the whole day (and week), so they are
@@ -432,8 +434,18 @@ def _greeks(rows, spot, expiry, stamp=""):
     return out
 
 
-def option_data(symbols):
-    """{sym: {'call_vol','call_oi','put_vol','put_oi'}} over ATM +/-5 strikes."""
+def option_data(symbols, anchors=None):
+    """{sym: {'call_vol','call_oi','put_vol','put_oi'}} over ATM +/-5 strikes,
+    plus 'call_oi_fix'/'put_oi_fix' over a band that stays put all day.
+
+    Why the fixed band: the ATM band follows spot, so whenever spot crosses a
+    strike midpoint one strike's OI leaves the sum and another's enters. On
+    2026-10-01 that made 296 of 6,616 ten-minute CALL OI changes swing >25%
+    (98 of 208 stocks; RVNL 4439 -> 2059 -> 4329) -- the band moving, not
+    positions. `anchors` {sym: previous close} fixes the band at the strikes
+    around yesterday's close, so successive snapshots sum the SAME contracts
+    and their difference is real writing or unwinding."""
+    anchors = anchors or {}
     sessions = [_chain_session() for _ in range(WORKERS)]
     out = {}
 
@@ -490,6 +502,21 @@ def option_data(symbols):
                     return ""          # no two-sided quote (closed, or illiquid)
                 return round((a - b) / mid * 100, 2)
 
+            # Fixed band: same width, centred on the strike nearest yesterday's
+            # close (spot only if there is no close). Yesterday's OI on these
+            # exact contracts comes from openInterest - changeinOpenInterest.
+            a_px = float(anchors.get(sym) or 0) or spot
+            fa = min(range(len(ks)), key=lambda i: abs(ks[i] - a_px))
+            co_f = po_f = co_f0 = po_f0 = 0
+            for z in rows[max(0, fa - STRIKES): fa + STRIKES + 1]:
+                ce, pe = z.get("CE") or {}, z.get("PE") or {}
+                _c = int(float(ce.get("openInterest", 0) or 0))
+                _p = int(float(pe.get("openInterest", 0) or 0))
+                co_f += _c
+                po_f += _p
+                co_f0 += _c - int(float(ce.get("changeinOpenInterest", 0) or 0))
+                po_f0 += _p - int(float(pe.get("changeinOpenInterest", 0) or 0))
+
             atm_row = rows[atm]
             c_sp = _spread(atm_row.get("CE") or {})
             p_sp = _spread(atm_row.get("PE") or {})
@@ -501,6 +528,8 @@ def option_data(symbols):
                          "put_vol": pv, "put_oi": po,
                          "call_prev_oi": c_prev, "put_prev_oi": p_prev,
                          "call_sprd": c_sp, "put_sprd": p_sp,
+                         "call_oi_fix": co_f, "put_oi_fix": po_f,
+                         "call_oi_fix_prev": co_f0, "put_oi_fix_prev": po_f0,
                          "greeks": _greeks(sel, spot, exps[0], rec.get("timestamp", "")),
                          "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
         except Exception:
@@ -748,7 +777,9 @@ def main():
 
     cash = cash_data(syms, d1);        print(f"  cash    {len(cash)}")
     fut  = fetch_oi_spurts();          print(f"  futures {len(fut)}")
-    opt  = option_data(syms);          print(f"  options {len(opt)}")
+    anchors = {s: v["close"] for s, v in (cashp[0] if cashp else {}).items()
+               if v.get("close")}
+    opt  = option_data(syms, anchors); print(f"  options {len(opt)}")
     fo, _fdates = prev_fno_volumes(days=2)
 
     p1 = cashp[0] if len(cashp) > 0 else {}
@@ -842,6 +873,12 @@ def main():
                 put(s, "CALL SPRD", o["call_sprd"])
             if o.get("put_sprd") != "":
                 put(s, "PUT SPRD", o["put_sprd"])
+            # Fixed band: same contracts all day, so cell-to-cell change is
+            # real. PrevDay = yesterday's OI on those same contracts.
+            put(s, "CALL OI FIX", o["call_oi_fix"])
+            put(s, "PUT OI FIX",  o["put_oi_fix"])
+            ref(s, "CALL OI FIX", "PrevDay", o["call_oi_fix_prev"])
+            ref(s, "PUT OI FIX",  "PrevDay", o["put_oi_fix_prev"])
             # Contracts -> shares with the bhavcopy lot size, so these sit in
             # the same unit as CASH VOL and FUT OI.
             gk, lot_ = o.get("greeks"), (f1.get(s) or {}).get("lot", 0)

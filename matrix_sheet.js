@@ -307,20 +307,29 @@ function setupCalc() {
   sh.getRange(f, 15, CALC_ROWS, 7).setFormulas(rsi).setNumberFormat('0.00');
 
   /* --- STEP 3: OI change, its EMAs, price EMA, setups -------------------- */
-  /* Columns W..AI, reading the STEP 1 grid: B PRICE, C VWAP, H CALL OI,
-     J PUT OI. EMA = alpha x value + (1 - alpha) x previous EMA, alpha = 2/(N+1),
+  /* Columns W..AK. OI comes from the FIXED-band rows (strikes around
+     yesterday's close, same contracts all day): the ATM band in STEP 1 moves
+     with spot, so its 10-minute change mixes band shifts with real writing.
+     Price/VWAP come from the STEP 1 grid (B, C).
+     EMA = alpha x value + (1 - alpha) x previous EMA, alpha = 2/(N+1),
      seeded with the simple average of the first N values (blank before). */
-  const S3 = 23, S3N = 13;
+  const S3 = 23, S3N = 15;
   const cl = function (n) {                  /* 1 -> A, 27 -> AA */
     let s = '';
     for (; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s;
     return s;
   };
-  const W = cl(S3), X = cl(S3 + 1), Y = cl(S3 + 2), Z = cl(S3 + 3), AA = cl(S3 + 4),
-        AB = cl(S3 + 5), AC = cl(S3 + 6);
+  const FC = cl(S3), FP = cl(S3 + 1),       /* fixed-band CALL / PUT OI */
+        W = cl(S3 + 2), X = cl(S3 + 3), Y = cl(S3 + 4), Z = cl(S3 + 5), AA = cl(S3 + 6),
+        AB = cl(S3 + 7), AC = cl(S3 + 8);
+  const fixed = function (metric, r) {
+    return '=IF($A' + r + '="","",IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|' + metric
+           + '|"&$A' + r + ',' + L + '$E:$E,0)),""))';
+  };
   sh.getRange(f - 2, S3).setValue('STEP 3  -  Change in OI, its EMA (OI_EMA), price EMA (PX_EMA) '
                                   + 'and the setups they define').setFontWeight('bold');
-  sh.getRange(f - 1, S3, 1, S3N).setValues([['CE OI chg', 'PE OI chg', 'Net OI chg  PE-CE',
+  sh.getRange(f - 1, S3, 1, S3N).setValues([['CALL OI fixed band', 'PUT OI fixed band',
+    'CE OI chg', 'PE OI chg', 'Net OI chg  PE-CE',
     'EMA Net', 'EMA CE chg', 'EMA PE chg', 'EMA Price', 'Price vs VWAP %', 'Price vs EMA %',
     'Net vs EMA cross', 'Alignment', 'Setup', 'Hold']]);
   /* EMA of column `src` whose values start on row `s0`, period named `p`. */
@@ -336,8 +345,10 @@ function setupCalc() {
   for (let r = f; r <= last; r++) {
     const q = r - 1, first = r === f;
     s3.push([
-      first ? '' : '=IF(OR($H' + r + '="",$H' + q + '=""),"",$H' + r + '-$H' + q + ')',
-      first ? '' : '=IF(OR($J' + r + '="",$J' + q + '=""),"",$J' + r + '-$J' + q + ')',
+      fixed('CALL OI FIX', r),
+      fixed('PUT OI FIX', r),
+      first ? '' : '=IF(OR(' + FC + r + '="",' + FC + q + '=""),"",' + FC + r + '-' + FC + q + ')',
+      first ? '' : '=IF(OR(' + FP + r + '="",' + FP + q + '=""),"",' + FP + r + '-' + FP + q + ')',
       first ? '' : '=IF(OR(' + W + r + '="",' + X + r + '=""),"",' + X + r + '-' + W + r + ')',
       ema(Y, Z, f + 1, 'OI_EMA', r),
       ema(W, AA, f + 1, 'OI_EMA', r),
@@ -370,11 +381,11 @@ function setupCalc() {
     ]);
   }
   sh.getRange(f, S3, CALC_ROWS, S3N).setFormulas(s3);
-  sh.getRange(f, S3, CALC_ROWS, 6).setNumberFormat('#,##0;-#,##0');
-  sh.getRange(f, S3 + 6, CALC_ROWS, 1).setNumberFormat('#,##0.00');
-  sh.getRange(f, S3 + 7, CALC_ROWS, 2).setNumberFormat('0.00');
-  sh.getRange(f, S3 + 9, CALC_ROWS, 4).setHorizontalAlignment('center').setFontWeight('bold');
-  const tag = cl(S3 + 9) + f + ':' + cl(S3 + 12) + last;
+  sh.getRange(f, S3, CALC_ROWS, 8).setNumberFormat('#,##0;-#,##0');
+  sh.getRange(f, S3 + 8, CALC_ROWS, 1).setNumberFormat('#,##0.00');
+  sh.getRange(f, S3 + 9, CALC_ROWS, 2).setNumberFormat('0.00');
+  sh.getRange(f, S3 + 11, CALC_ROWS, 4).setHorizontalAlignment('center').setFontWeight('bold');
+  const tag = cl(S3 + 11) + f + ':' + cl(S3 + 14) + last;
   const cf = sh.getConditionalFormatRules();
   [['CROSS UP', '#137333'], ['BULL', '#137333'], ['LONG', '#137333'], ['HOLD LONG', '#137333'],
    ['CROSS DOWN', '#C5221F'], ['BEAR', '#C5221F'], ['SHORT', '#C5221F'], ['HOLD SHORT', '#C5221F'],
@@ -398,7 +409,7 @@ function setupCalc() {
   for (let c = 2; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 82);
   sh.setColumnWidth(14, 18);                /* gaps between the steps */
   sh.setColumnWidth(22, 18);
-  for (let c = S3 + 9; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
+  for (let c = S3 + 11; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
   sh.setFrozenRows(2);
 
   setCalcSymbols_(sh);
