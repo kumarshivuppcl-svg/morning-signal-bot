@@ -829,9 +829,19 @@ def main():
     day = now.strftime("%Y-%m-%d")
     col = f"{now.hour:02d}:{(now.minute // 10) * 10:02d}"   # snap to 10-min
 
+    # NSE holidays: the feeds keep serving the last session's closing figures,
+    # so a run would record a fake day (2026-10-02 got 9 identical snapshots
+    # of 1 Oct's close). Skip before touching any data.
+    refresh_holidays(day)
+    try:
+        hol = set(pd.read_csv(os.path.join(DATA_D, "holidays.csv"), dtype=str)["date"])
+    except Exception:
+        hol = set()
+    if day in hol:
+        print(f"{day} is an NSE F&O holiday - nothing to record"); return
+
     syms = universe()
     print(f"universe {len(syms)}")
-    refresh_holidays(day)
     save_daily(day, syms)
 
     df = load_or_init(day, syms)
