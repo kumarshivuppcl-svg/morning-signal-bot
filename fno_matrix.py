@@ -84,6 +84,7 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # in -- an edge either clears the spread or it does not.
 # CALL/PUT OI FIX: OI over ATM +/-5 around YESTERDAY'S close, fixed for the
 # day, so the 10-minute change is not polluted by the band moving with spot.
+# ATM IV: implied volatility at the ATM strike, % a year (NSE's own figure).
 # EXPIRY: the option expiry all option rows refer to, as YYYY-MM-DD text --
 # the one non-numeric row; days to expiry is worked out in the sheet.
 # CALL/PUT DOI are delta-weighted OI and CALL/PUT GEX gamma exposure over the
@@ -93,7 +94,8 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI",
             "CALL SPRD", "PUT SPRD", "CALL OI FIX", "PUT OI FIX",
-            "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE", "EXPIRY"]
+            "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE", "EXPIRY",
+            "ATM IV"]
 # dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
 # on the PRICE row. They are fixed for the whole day (and week), so they are
 # fetched once and left alone -- see pivot_range().
@@ -227,8 +229,15 @@ def nse_cash_prev(days=2):
             if r.status_code != 200 or len(r.content) < 500:
                 return {}
             out = {}
+            want = d.strftime("%d-%b-%Y").lower()
             for x in csv.DictReader(r.text.splitlines()):
                 k = {kk.strip(): vv for kk, vv in x.items() if kk}
+                # For a holiday NSE serves the PREVIOUS session's file under the
+                # holiday's name (14-Sep-2026 returns 11-Sep). Without this check
+                # that session was counted twice -- PrevDay2 became a copy of
+                # PrevDay on the day after every holiday.
+                if str(k.get("DATE1", "")).strip().lower() != want:
+                    return {}
                 if k.get("SERIES", "").strip() != "EQ":
                     continue
                 try:
@@ -255,7 +264,7 @@ def nse_cash_prev(days=2):
             return {}
 
     d, got, dates = _now().date(), [], []
-    for _ in range(12):
+    for _ in range(max(12, days * 2)):     # calendar days back, room for holidays
         d -= timedelta(days=1)
         if d.weekday() >= 5:
             continue
@@ -520,6 +529,12 @@ def option_data(symbols, anchors=None):
                 po_f0 += _p - int(float(pe.get("changeinOpenInterest", 0) or 0))
 
             atm_row = rows[atm]
+            # ATM implied volatility, % a year: mean of the call and put IV at
+            # the ATM strike (either alone if the other is untraded).
+            _ivs = [float((atm_row.get(sd) or {}).get("impliedVolatility", 0) or 0)
+                    for sd in ("CE", "PE")]
+            _ivs = [v for v in _ivs if v > 0]
+            atm_iv = round(sum(_ivs) / len(_ivs), 2) if _ivs else ""
             c_sp = _spread(atm_row.get("CE") or {})
             p_sp = _spread(atm_row.get("PE") or {})
 
@@ -530,7 +545,7 @@ def option_data(symbols, anchors=None):
                          "put_vol": pv, "put_oi": po,
                          "call_prev_oi": c_prev, "put_prev_oi": p_prev,
                          "call_sprd": c_sp, "put_sprd": p_sp,
-                         "call_oi_fix": co_f, "put_oi_fix": po_f,
+                         "call_oi_fix": co_f, "put_oi_fix": po_f, "atm_iv": atm_iv,
                          "call_oi_fix_prev": co_f0, "put_oi_fix_prev": po_f0,
                          "greeks": _greeks(sel, spot, exps[0], rec.get("timestamp", "")),
                          "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
@@ -728,6 +743,32 @@ def refresh_holidays(day):
         print(f"  holidays: fetch failed ({type(e).__name__}), keeping existing file")
 
 
+DAILY_N = 30   # completed sessions kept for ATR and other daily-range work
+
+
+def save_daily(day, symbols):
+    """Last DAILY_N completed sessions' high/low/close per stock, from NSE's
+    cash bhavcopy -> data/daily.csv (Symbol,Date,High,Low,Close,AsOf).
+    One file overwritten daily rather than one per day, so the repo does not
+    grow by ~250 KB a session. Written once a day (AsOf = that day); the sheet
+    derives True Range and ATR from it with an editable period."""
+    p = os.path.join(DATA_D, "daily.csv")
+    try:
+        if pd.read_csv(p, dtype=str, nrows=1)["AsOf"].iloc[0] == day:
+            return
+    except Exception:
+        pass
+    sess, dates = nse_cash_prev(days=DAILY_N)
+    want = set(symbols)
+    rows = [{"Symbol": sym, "Date": d, "High": v["high"], "Low": v["low"],
+             "Close": v["close"], "AsOf": day}
+            for x, d in zip(sess, dates) for sym, v in x.items()
+            if sym in want and v["high"] > 0]
+    if rows:
+        pd.DataFrame(rows).sort_values(["Symbol", "Date"]).to_csv(p, index=False)
+        print(f"  daily history: {len(dates)} sessions x {len(want)} stocks saved")
+
+
 def _blank(v):
     """True when a cell is genuinely empty (handles pandas NaN -> 'nan')."""
     t = str(v).strip().lower()
@@ -791,6 +832,7 @@ def main():
     syms = universe()
     print(f"universe {len(syms)}")
     refresh_holidays(day)
+    save_daily(day, syms)
 
     df = load_or_init(day, syms)
     key = {(r.Symbol, r.Metric): i for i, r in enumerate(df.itertuples())}
@@ -911,6 +953,8 @@ def main():
             # real. PrevDay = yesterday's OI on those same contracts.
             if o.get("expiry"):
                 put(s, "EXPIRY", o["expiry"])
+            if o.get("atm_iv") != "":
+                put(s, "ATM IV", o["atm_iv"])
             put(s, "CALL OI FIX", o["call_oi_fix"])
             put(s, "PUT OI FIX",  o["put_oi_fix"])
             ref(s, "CALL OI FIX", "PrevDay", o["call_oi_fix_prev"])

@@ -167,6 +167,28 @@ function pullLong_(day, matrixRows) {
       }
     });
   }
+  /* Last ~30 completed sessions' high/low/close (collector, once a day) for
+     True Range and ATR on CALC. SESSION rows list the dates, oldest first. */
+  const dr = UrlFetchApp.fetch(RAW + 'daily.csv?cb=' + Date.now(), { muteHttpExceptions: true });
+  if (dr.getResponseCode() === 200) {
+    const dv = Utilities.parseCsv(dr.getContentText());
+    const dh = dv[0].map(function (x) { return String(x).trim(); });
+    const iS = dh.indexOf('Symbol'), iD = dh.indexOf('Date'), iH = dh.indexOf('High'),
+          iL = dh.indexOf('Low'), iC = dh.indexOf('Close');
+    const dates = {};
+    dv.slice(1).forEach(function (x) {
+      const sy = String(x[iS] || '').trim(), dt = String(x[iD] || '').trim();
+      if (!sy || !dt) return;
+      dates[dt] = 1;
+      [['DAILY H', iH], ['DAILY L', iL], ['DAILY C', iC]].forEach(function (m) {
+        const v = Number(x[m[1]]);
+        if (!isNaN(v)) refRows.push([sy, m[0], dt, v, sy + '|' + m[0] + '|' + dt]);
+      });
+    });
+    Object.keys(dates).sort().forEach(function (dt) {
+      refRows.push(['_ALL', 'SESSION', dt, dt, '_ALL|SESSION|' + dt]);
+    });
+  }
   const fr = UrlFetchApp.fetch(RAW + 'fut_' + day + '.csv?cb=' + Date.now(),
                                { muteHttpExceptions: true });
   if (fr.getResponseCode() === 200) add(Utilities.parseCsv(fr.getContentText()));
@@ -200,7 +222,7 @@ function setupCalc() {
   const keep = {};
   if (sh) {                                 /* preserve user choices */
     keep.sym = sh.getRange('B2').getValue();
-    keep.params = sh.getRange('A5:C11').getValues();
+    keep.params = sh.getRange('A5:C13').getValues();
   } else {
     sh = ss.insertSheet(CALC_TAB);
   }
@@ -233,10 +255,13 @@ function setupCalc() {
     ['PX_EMA',     'Price EMA period',  20,  'EMA of the 10-minute PRICE  (name: PX_EMA)'],
     ['FLAT_BAND',  'Flat band %',       0.1, 'price within this % of its EMA = consolidating  (name: FLAT_BAND)'],
     ['PIN_BAND',   'Pin band %',        1,   'price within this % of GEX STRIKE = at the pin  (name: PIN_BAND)'],
-    ['GEX_MIN',    'GEX minimum %',     3,   'GEX below this % of the previous day cash volume = too small to matter  (name: GEX_MIN)']
+    ['GEX_MIN',    'GEX minimum %',     3,   'GEX below this % of the previous day cash volume = too small to matter  (name: GEX_MIN)'],
+    ['ATR_PERIOD', 'ATR period',        14,  'daily sessions, Wilder smoothing  (name: ATR_PERIOD; at most 30)'],
+    ['CPR_NARROW', 'CPR narrow %',      0.25, 'daily CPR width at or below this % = NARROW (trend day)  (name: CPR_NARROW)'],
+    ['CPR_WIDE',   'CPR wide %',        0.75, 'daily CPR width at or above this % = WIDE (range day)  (name: CPR_WIDE)']
   ];
   const params = [];
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 9; i++) {
     const old = keep.params ? keep.params[i] : ['', '', ''];
     const def = PARAMS[i];
     if (def && (old[0] === '' || old[0] === def[1])) {
@@ -245,9 +270,9 @@ function setupCalc() {
       params.push(old);
     }
   }
-  sh.getRange('A5:C11').setValues(params);
-  sh.getRange('B5:B11').setBackground(yellow).setHorizontalAlignment('center');
-  sh.getRange('C5:C11').setFontColor('#5F6368').setFontSize(9);
+  sh.getRange('A5:C13').setValues(params);
+  sh.getRange('B5:B13').setBackground(yellow).setHorizontalAlignment('center');
+  sh.getRange('C5:C13').setFontColor('#5F6368').setFontSize(9);
   PARAMS.forEach(function (p, i) { ss.setNamedRange(p[0], sh.getRange('B' + (5 + i))); });
 
   /* --- reference values --------------------------------------------------- */
@@ -473,10 +498,115 @@ function setupCalc() {
   cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('GEX SMALL').setFontColor('#5F6368')
     .setRanges([tag4]).build());
   sh.setConditionalFormatRules(cf);
-  const END = S4 + S4N - 1;
+
+  /* --- STEP 5: range -- IV expected move, day's range, ATR, CPR width ---- */
+  /* IV is NSE's ATM figure, annualised on CALENDAR days (that is how NSE's
+     IV is computed), so moves scale with sqrt(days/365).
+     Day high/low here come from the 10-minute snapshots, so they can miss a
+     spike between snapshots. ATR is the latest value from STEP 6. */
+  const S5 = S4 + S4N + 1, S5N = 14;
+  const C5 = function (i) { return cl(S5 + i); };
+  const DTE = cl(S4 + 13);                  /* STEP 4: days to expiry */
+  const RF = "'" + REF_TAB + "'!";
+  const refv = function (metric, field) {
+    return 'IFERROR(INDEX(' + RF + '$D:$D,MATCH($B$2&"|' + metric + '|' + field + '",' + RF + '$E:$E,0)),"")';
+  };
+  const S6 = S5 + S5N + 1, S6N = 7, S6ROWS = 40;
+  const C6 = function (i) { return cl(S6 + i); };
+  const atrRng = '$' + C6(5) + '$' + f + ':$' + C6(5) + '$' + (f + S6ROWS - 1);
+  const lastAtr = 'INDEX(' + atrRng + ',MAX(FILTER(ROW(' + atrRng + '),ISNUMBER(' + atrRng + ')))-'
+                  + (f - 1) + ')';
+  const cprW = function (tc, bc) {
+    return 'IFERROR(ABS(' + refv('PRICE', tc) + '-' + refv('PRICE', bc) + ')/(('
+      + refv('PRICE', tc) + '+' + refv('PRICE', bc) + ')/2)*100,"")';
+  };
+  sh.getRange(f - 2, S5).setValue('STEP 5  -  Range: IV expected move, range used, ATR, CPR width')
+    .setFontWeight('bold');
+  sh.getRange(f - 1, S5, 1, S5N).setValues([['ATM IV %', '1-day move (IV)', 'Move to expiry (IV)',
+    'Upper (expiry)', 'Lower (expiry)', 'Day high (snaps)', 'Day low (snaps)',
+    'Range used % of 1-day move', 'ATR', 'Range used % of ATR', '1-day move / ATR',
+    'Daily CPR width %', 'CPR type', 'Weekly CPR width %']]);
+  const s5 = [];
+  for (let r = f; r <= last; r++) {
+    const c = function (i) { return C5(i) + r; };
+    s5.push([
+      fixed('ATM IV', r),
+      '=IF(OR($B' + r + '="",' + c(0) + '=""),"",$B' + r + '*' + c(0) + '/100*SQRT(1/365))',
+      '=IF(OR(' + c(1) + '="",' + DTE + r + '=""),"",$B' + r + '*' + c(0) + '/100*SQRT(MAX('
+        + DTE + r + ',1)/365))',
+      '=IF(' + c(2) + '="","",$B' + r + '+' + c(2) + ')',
+      '=IF(' + c(2) + '="","",$B' + r + '-' + c(2) + ')',
+      '=IF($B' + r + '="","",MAX($B$' + f + ':$B' + r + '))',
+      '=IF($B' + r + '="","",MIN($B$' + f + ':$B' + r + '))',
+      '=IF(OR(' + c(1) + '="",' + c(5) + '=""),"",(' + c(5) + '-' + c(6) + ')/' + c(1) + '*100)',
+      '=IF($B' + r + '="","",IFERROR(' + lastAtr + ',""))',
+      '=IF(OR(' + c(5) + '="",N(' + c(8) + ')=0),"",(' + c(5) + '-' + c(6) + ')/' + c(8) + '*100)',
+      '=IF(OR(' + c(1) + '="",N(' + c(8) + ')=0),"",' + c(1) + '/' + c(8) + ')',
+      '=IF($B' + r + '="","",' + cprW('dTC', 'dBC') + ')',
+      '=IF(' + c(11) + '="","",IF(' + c(11) + '<=CPR_NARROW,"NARROW",IF(' + c(11)
+        + '>=CPR_WIDE,"WIDE","NORMAL")))',
+      '=IF($B' + r + '="","",' + cprW('wTC', 'wBC') + ')'
+    ]);
+  }
+  sh.getRange(f, S5, CALC_ROWS, S5N).setFormulas(s5);
+  sh.getRange(f, S5, CALC_ROWS, 1).setNumberFormat('0.00');
+  sh.getRange(f, S5 + 1, CALC_ROWS, 6).setNumberFormat('#,##0.00');
+  sh.getRange(f, S5 + 7, CALC_ROWS, 1).setNumberFormat('0');
+  sh.getRange(f, S5 + 8, CALC_ROWS, 1).setNumberFormat('#,##0.00');
+  sh.getRange(f, S5 + 9, CALC_ROWS, 1).setNumberFormat('0');
+  sh.getRange(f, S5 + 10, CALC_ROWS, 2).setNumberFormat('0.00');
+  sh.getRange(f, S5 + 12, CALC_ROWS, 1).setHorizontalAlignment('center').setFontWeight('bold');
+  sh.getRange(f, S5 + 13, CALC_ROWS, 1).setNumberFormat('0.00');
+  const tag5 = sh.getRange(C5(12) + f + ':' + C5(12) + last);
+  cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('WIDE').setFontColor('#137333')
+    .setRanges([tag5]).build());
+  cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('NARROW').setFontColor('#1A73E8')
+    .setRanges([tag5]).build());
+
+  /* --- STEP 6: daily True Range and ATR (last completed sessions) -------- */
+  /* TR = max(High - Low, |High - prev Close|, |Low - prev Close|); the first
+     session has no previous close, so TR = High - Low.
+     ATR (Wilder): first value = simple average of the first ATR_PERIOD TRs,
+     then ATR = (previous ATR x (N-1) + TR) / N. Rows run oldest -> newest. */
+  sh.getRange(f - 2, S6).setValue('STEP 6  -  Daily True Range and ATR(ATR_PERIOD), oldest -> newest')
+    .setFontWeight('bold');
+  sh.getRange(f - 1, S6, 1, S6N).setValues([['Session', 'High', 'Low', 'Close', 'True Range',
+    'ATR', 'ATR % of close']]);
+  const s6 = [];
+  for (let r = f; r < f + S6ROWS; r++) {
+    const c = function (i) { return C6(i) + r; };
+    const p = function (i) { return C6(i) + (r - 1); };
+    const daily = function (m) {
+      return '=IF(' + c(0) + '="","",IFERROR(INDEX(' + RF + '$D:$D,MATCH($B$2&"|' + m + '|"&'
+        + c(0) + ',' + RF + '$E:$E,0)),""))';
+    };
+    const k = '(ROW()-' + (f - 1) + ')';
+    s6.push([
+      r === f ? '=IFERROR(FILTER(' + RF + '$C:$C,(' + RF + '$A:$A="_ALL")*(' + RF
+        + '$B:$B="SESSION")),"")' : '',
+      daily('DAILY H'), daily('DAILY L'), daily('DAILY C'),
+      r === f
+        ? '=IF(OR(' + c(1) + '="",' + c(2) + '=""),"",' + c(1) + '-' + c(2) + ')'
+        : '=IF(OR(' + c(1) + '="",' + c(2) + '=""),"",IF(' + p(3) + '="",' + c(1) + '-' + c(2)
+          + ',MAX(' + c(1) + '-' + c(2) + ',ABS(' + c(1) + '-' + p(3) + '),ABS(' + c(2) + '-'
+          + p(3) + '))))',
+      '=IF(' + c(0) + '="","",IF(' + k + '<ATR_PERIOD,"",IF(' + k + '=ATR_PERIOD,'
+        + 'IFERROR(AVERAGE(OFFSET($' + C6(4) + '$' + f + ',0,0,ATR_PERIOD,1)),""),'
+        + (r === f ? '""' : 'IF(' + c(4) + '="",' + p(5) + ',IF(' + p(5) + '="","",(' + p(5)
+          + '*(ATR_PERIOD-1)+' + c(4) + ')/ATR_PERIOD))') + ')))',
+      '=IF(OR(' + c(5) + '="",N(' + c(3) + ')=0),"",' + c(5) + '/' + c(3) + '*100)'
+    ]);
+  }
+  sh.getRange(f, S6, S6ROWS, S6N).setFormulas(s6);
+  sh.getRange(f, S6 + 1, S6ROWS, 5).setNumberFormat('#,##0.00');
+  sh.getRange(f, S6 + 6, S6ROWS, 1).setNumberFormat('0.00');
+  sh.getRange(f, S6 + 5, S6ROWS, 1).setFontWeight('bold');
+  sh.setConditionalFormatRules(cf);
+  const END = S6 + S6N - 1;
 
   /* --- look -------------------------------------------------------------- */
-  [[f - 1, 1, hdr1.length], [f - 1, 15, 7], [f - 1, S3, S3N], [f - 1, S4, S4N]].forEach(function (h) {
+  [[f - 1, 1, hdr1.length], [f - 1, 15, 7], [f - 1, S3, S3N], [f - 1, S4, S4N],
+   [f - 1, S5, S5N], [f - 1, S6, S6N]].forEach(function (h) {
     sh.getRange(h[0], h[1], 1, h[2]).setFontWeight('bold').setBackground(head)
       .setFontColor('#FFFFFF').setHorizontalAlignment('center').setWrap(true);
   });
@@ -487,7 +617,7 @@ function setupCalc() {
   sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
   sh.setColumnWidth(1, 150);
   for (let c = 2; c <= END; c++) sh.setColumnWidth(c, 82);
-  sh.setColumnWidth(S4 - 1, 18);
+  [S4 - 1, S5 - 1, S6 - 1].forEach(function (c) { sh.setColumnWidth(c, 18); });
   sh.setColumnWidth(14, 18);                /* gaps between the steps */
   sh.setColumnWidth(22, 18);
   for (let c = S3 + 11; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
