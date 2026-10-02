@@ -210,14 +210,28 @@ function setupCalc() {
   /* --- parameters --------------------------------------------------------- */
   sh.getRange('A4').setValue('PARAMETERS  -  edit the yellow cells; every formula below reads them')
     .setFontWeight('bold');
-  const params = keep.params || [['RSI period', 14, 'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)']];
-  if (!keep.params) {
-    for (let i = 1; i < 7; i++) params.push(['', '', '']);
+  /* One slot per parameter, each with a range name the formulas use. A value
+     already typed in a slot is kept on rebuild; an empty slot gets the default. */
+  const PARAMS = [
+    ['RSI_PERIOD', 'RSI period',        14,  'number of 10-minute bars, Wilder smoothing  (name: RSI_PERIOD)'],
+    ['OI_EMA',     'OI EMA period',     9,   'EMA of Net / CE / PE change in OI, 10-minute bars  (name: OI_EMA)'],
+    ['PX_EMA',     'Price EMA period',  20,  'EMA of the 10-minute PRICE  (name: PX_EMA)'],
+    ['FLAT_BAND',  'Flat band %',       0.1, 'price within this % of its EMA = consolidating  (name: FLAT_BAND)']
+  ];
+  const params = [];
+  for (let i = 0; i < 7; i++) {
+    const old = keep.params ? keep.params[i] : ['', '', ''];
+    const def = PARAMS[i];
+    if (def && (old[0] === '' || old[0] === def[1])) {
+      params.push([def[1], old[1] === '' ? def[2] : old[1], def[3]]);
+    } else {
+      params.push(old);
+    }
   }
   sh.getRange('A5:C11').setValues(params);
   sh.getRange('B5:B11').setBackground(yellow).setHorizontalAlignment('center');
   sh.getRange('C5:C11').setFontColor('#5F6368').setFontSize(9);
-  ss.setNamedRange('RSI_PERIOD', sh.getRange('B5'));
+  PARAMS.forEach(function (p, i) { ss.setNamedRange(p[0], sh.getRange('B' + (5 + i))); });
 
   /* --- reference values --------------------------------------------------- */
   const ref = function (metric, field) {
@@ -292,24 +306,104 @@ function setupCalc() {
   }
   sh.getRange(f, 15, CALC_ROWS, 7).setFormulas(rsi).setNumberFormat('0.00');
 
+  /* --- STEP 3: OI change, its EMAs, price EMA, setups -------------------- */
+  /* Columns W..AI, reading the STEP 1 grid: B PRICE, C VWAP, H CALL OI,
+     J PUT OI. EMA = alpha x value + (1 - alpha) x previous EMA, alpha = 2/(N+1),
+     seeded with the simple average of the first N values (blank before). */
+  const S3 = 23, S3N = 13;
+  const cl = function (n) {                  /* 1 -> A, 27 -> AA */
+    let s = '';
+    for (; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + (n - 1) % 26) + s;
+    return s;
+  };
+  const W = cl(S3), X = cl(S3 + 1), Y = cl(S3 + 2), Z = cl(S3 + 3), AA = cl(S3 + 4),
+        AB = cl(S3 + 5), AC = cl(S3 + 6);
+  sh.getRange(f - 2, S3).setValue('STEP 3  -  Change in OI, its EMA (OI_EMA), price EMA (PX_EMA) '
+                                  + 'and the setups they define').setFontWeight('bold');
+  sh.getRange(f - 1, S3, 1, S3N).setValues([['CE OI chg', 'PE OI chg', 'Net OI chg  PE-CE',
+    'EMA Net', 'EMA CE chg', 'EMA PE chg', 'EMA Price', 'Price vs VWAP %', 'Price vs EMA %',
+    'Net vs EMA cross', 'Alignment', 'Setup', 'Hold']]);
+  /* EMA of column `src` whose values start on row `s0`, period named `p`. */
+  const ema = function (src, me, s0, p, r) {
+    const k = '(ROW()-' + (s0 - 1) + ')';          /* values seen so far */
+    if (r < s0) return '';
+    return '=IF($A' + r + '="","",IF(' + k + '<' + p + ',"",IF(' + k + '=' + p + ','
+      + 'IFERROR(AVERAGE(OFFSET($' + src + '$' + s0 + ',0,0,' + p + ',1)),""),'
+      + 'IF(' + src + r + '="",' + me + (r - 1) + ',IF(' + me + (r - 1) + '="","",'
+      + src + r + '*2/(' + p + '+1)+' + me + (r - 1) + '*(1-2/(' + p + '+1)))))))';
+  };
+  const s3 = [];
+  for (let r = f; r <= last; r++) {
+    const q = r - 1, first = r === f;
+    s3.push([
+      first ? '' : '=IF(OR($H' + r + '="",$H' + q + '=""),"",$H' + r + '-$H' + q + ')',
+      first ? '' : '=IF(OR($J' + r + '="",$J' + q + '=""),"",$J' + r + '-$J' + q + ')',
+      first ? '' : '=IF(OR(' + W + r + '="",' + X + r + '=""),"",' + X + r + '-' + W + r + ')',
+      ema(Y, Z, f + 1, 'OI_EMA', r),
+      ema(W, AA, f + 1, 'OI_EMA', r),
+      ema(X, AB, f + 1, 'OI_EMA', r),
+      ema('B', AC, f, 'PX_EMA', r),
+      '=IF(OR($B' + r + '="",$C' + r + '=""),"",($B' + r + '/$C' + r + '-1)*100)',
+      '=IF(OR($B' + r + '="",' + AC + r + '=""),"",($B' + r + '/' + AC + r + '-1)*100)',
+      /* Net OI change crossing its EMA (rule 1 trigger) */
+      first ? '' : '=IF(OR(' + Y + r + '="",' + Z + r + '="",' + Y + q + '="",' + Z + q + '=""),"",'
+        + 'IF(AND(' + Y + r + '>' + Z + r + ',' + Y + q + '<=' + Z + q + '),"CROSS UP",'
+        + 'IF(AND(' + Y + r + '<' + Z + r + ',' + Y + q + '>=' + Z + q + '),"CROSS DOWN","")))',
+      /* rule 1: Net OI chg vs its EMA, with price vs VWAP */
+      '=IF(OR(' + Y + r + '="",' + Z + r + '="",$C' + r + '=""),"",'
+        + 'IF(AND(' + Y + r + '>' + Z + r + ',$B' + r + '>$C' + r + '),"BULL",'
+        + 'IF(AND(' + Y + r + '<' + Z + r + ',$B' + r + '<$C' + r + '),"BEAR","")))',
+      /* table: price direction, price vs EMA, CE chg vs EMA, PE chg vs EMA */
+      first ? '' : '=IF(OR(' + AC + r + '="",' + W + r + '="",' + AA + r + '="",' + X + r + '="",'
+        + AB + r + '=""),"",IF(ABS($B' + r + '/' + AC + r + '-1)*100<=FLAT_BAND,"RANGE",'
+        + 'IF(AND($B' + r + '>$B' + q + ',$B' + r + '>' + AC + r + ',' + W + r + '<' + AA + r + ','
+        + X + r + '>' + AB + r + '),"LONG",'
+        + 'IF(AND($B' + r + '<$B' + q + ',$B' + r + '<' + AC + r + ',' + W + r + '>' + AA + r + ','
+        + X + r + '<' + AB + r + '),"SHORT",'
+        + 'IF(AND($B' + r + '>$B' + q + ',$B' + r + '>' + AC + r + ',' + W + r + '>' + AA + r + ','
+        + X + r + '<=' + AB + r + '),"TRAP",'
+        + 'IF(AND($B' + r + '>$B' + q + ',' + X + r + '<' + AB + r + '),"NO BACKING",""))))))',
+      /* rule 3: hold while price stays on its side of the EMA and writers defend */
+      '=IF(OR(' + AC + r + '="",' + AA + r + '="",' + AB + r + '=""),"",'
+        + 'IF(AND($B' + r + '>' + AC + r + ',' + X + r + '>' + AB + r + '),"HOLD LONG",'
+        + 'IF(AND($B' + r + '<' + AC + r + ',' + W + r + '>' + AA + r + '),"HOLD SHORT","")))'
+    ]);
+  }
+  sh.getRange(f, S3, CALC_ROWS, S3N).setFormulas(s3);
+  sh.getRange(f, S3, CALC_ROWS, 6).setNumberFormat('#,##0;-#,##0');
+  sh.getRange(f, S3 + 6, CALC_ROWS, 1).setNumberFormat('#,##0.00');
+  sh.getRange(f, S3 + 7, CALC_ROWS, 2).setNumberFormat('0.00');
+  sh.getRange(f, S3 + 9, CALC_ROWS, 4).setHorizontalAlignment('center').setFontWeight('bold');
+  const tag = cl(S3 + 9) + f + ':' + cl(S3 + 12) + last;
+  const cf = sh.getConditionalFormatRules();
+  [['CROSS UP', '#137333'], ['BULL', '#137333'], ['LONG', '#137333'], ['HOLD LONG', '#137333'],
+   ['CROSS DOWN', '#C5221F'], ['BEAR', '#C5221F'], ['SHORT', '#C5221F'], ['HOLD SHORT', '#C5221F'],
+   ['TRAP', '#B06000'], ['NO BACKING', '#B06000'], ['RANGE', '#5F6368']].forEach(function (c) {
+    cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(c[0]).setFontColor(c[1])
+      .setRanges([sh.getRange(tag)]).build());
+  });
+  sh.setConditionalFormatRules(cf);
+
   /* --- look -------------------------------------------------------------- */
-  [[f - 1, 1, hdr1.length], [f - 1, 15, 7]].forEach(function (h) {
+  [[f - 1, 1, hdr1.length], [f - 1, 15, 7], [f - 1, S3, S3N]].forEach(function (h) {
     sh.getRange(h[0], h[1], 1, h[2]).setFontWeight('bold').setBackground(head)
       .setFontColor('#FFFFFF').setHorizontalAlignment('center').setWrap(true);
   });
   sh.getRange(f, 1, CALC_ROWS, 1).setFontWeight('bold');
   for (let i = 1; i < CALC_ROWS; i += 2) {
-    sh.getRange(f + i, 1, 1, 21).setBackground('#F1F3F4');
+    sh.getRange(f + i, 1, 1, S3 + S3N - 1).setBackground('#F1F3F4');
   }
   sh.getRange(f, 21, CALC_ROWS, 1).setFontWeight('bold');
   sh.setColumnWidth(1, 150);
-  for (let c = 2; c <= 21; c++) sh.setColumnWidth(c, 82);
-  sh.setColumnWidth(14, 18);                /* gap between the two steps */
+  for (let c = 2; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 82);
+  sh.setColumnWidth(14, 18);                /* gaps between the steps */
+  sh.setColumnWidth(22, 18);
+  for (let c = S3 + 9; c <= S3 + S3N - 1; c++) sh.setColumnWidth(c, 96);
   sh.setFrozenRows(2);
 
   setCalcSymbols_(sh);
-  console.log('CALC built: 1 parameter, ' + refs.length + ' reference values, '
-              + CALC_METRICS.length + ' raw columns, RSI example');
+  console.log('CALC built: ' + PARAMS.length + ' parameters, ' + refs.length
+              + ' reference values, ' + CALC_METRICS.length + ' raw columns, RSI, STEP 3');
 }
 
 /* Dropdown of every stock, so the page works even without the click script. */
