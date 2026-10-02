@@ -84,6 +84,8 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 # in -- an edge either clears the spread or it does not.
 # CALL/PUT OI FIX: OI over ATM +/-5 around YESTERDAY'S close, fixed for the
 # day, so the 10-minute change is not polluted by the band moving with spot.
+# EXPIRY: the option expiry all option rows refer to, as YYYY-MM-DD text --
+# the one non-numeric row; days to expiry is worked out in the sheet.
 # CALL/PUT DOI are delta-weighted OI and CALL/PUT GEX gamma exposure over the
 # same ATM +/-5 band, both in SHARES (see _greeks). DOI = the share position
 # that the open options are equivalent to; GEX = shares a fully hedged writer
@@ -91,7 +93,7 @@ _IDX     = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 METRICS  = ["PRICE", "VWAP", "CASH VOL", "F&O VOL", "F&O OI",
             "CALL VOL", "CALL OI", "PUT VOL", "PUT OI",
             "CALL SPRD", "PUT SPRD", "CALL OI FIX", "PUT OI FIX",
-            "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE"]
+            "CALL DOI", "PUT DOI", "CALL GEX", "PUT GEX", "GEX STRIKE", "EXPIRY"]
 # dTC/dBC and wTC/wBC are the Central Pivot Range, daily and weekly, carried
 # on the PRICE row. They are fixed for the whole day (and week), so they are
 # fetched once and left alone -- see pivot_range().
@@ -875,6 +877,8 @@ def main():
                 put(s, "PUT SPRD", o["put_sprd"])
             # Fixed band: same contracts all day, so cell-to-cell change is
             # real. PrevDay = yesterday's OI on those same contracts.
+            if o.get("expiry"):
+                put(s, "EXPIRY", o["expiry"])
             put(s, "CALL OI FIX", o["call_oi_fix"])
             put(s, "PUT OI FIX",  o["put_oi_fix"])
             ref(s, "CALL OI FIX", "PrevDay", o["call_oi_fix_prev"])

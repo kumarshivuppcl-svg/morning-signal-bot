@@ -152,6 +152,9 @@ function pullLong_(day, matrixRows) {
     }
   };
   add(matrixRows);
+  /* The data's own date, so CALC counts days to expiry from the snapshot
+     day rather than from whenever the sheet is opened. */
+  refRows.push(['_ALL', 'DAY', 'Date', day, '_ALL|DAY|Date']);
   const fr = UrlFetchApp.fetch(RAW + 'fut_' + day + '.csv?cb=' + Date.now(),
                                { muteHttpExceptions: true });
   if (fr.getResponseCode() === 200) add(Utilities.parseCsv(fr.getContentText()));
@@ -401,13 +404,17 @@ function setupCalc() {
      DOI = OI x delta (buyers' side); GEX = OI x gamma x price x 1% = shares a
      fully hedged writer trades per 1% move. Net GEX here is CALL - PUT (the
      US convention); which side NSE writers are on is not in the data. */
-  const S4 = S3 + S3N + 1, S4N = 12;
+  const S4 = S3 + S3N + 1, S4N = 15;
   const C4 = function (i) { return cl(S4 + i); };
   sh.getRange(f - 2, S4).setValue('STEP 4  -  Delta-weighted OI (DOI) and gamma exposure (GEX), '
                                   + 'shares;  pin = GEX STRIKE').setFontWeight('bold');
   sh.getRange(f - 1, S4, 1, S4N).setValues([['CALL DOI', 'PUT DOI', 'Net DOI', 'Net DOI % of FUT OI',
     'CALL GEX', 'PUT GEX', 'GEX total', 'Net GEX  CALL-PUT', 'GEX % of prev cash vol',
-    'GEX STRIKE', 'Pin distance %', 'Read']]);
+    'GEX STRIKE', 'Pin distance %', 'Read', 'Expiry', 'Days to expiry', 'Trading days left']]);
+  /* A date may arrive as text (Excel) or already converted (Sheets). */
+  const asDate = function (x) { return 'IF(ISNUMBER(' + x + '),' + x + ',DATEVALUE(' + x + '))'; };
+  const dataDay = 'IFERROR(INDEX(' + "'" + REF_TAB + "'!" + '$D:$D,MATCH("_ALL|DAY|Date",'
+                 + "'" + REF_TAB + "'!" + '$E:$E,0)),"")';
   const prevCash = 'IFERROR(INDEX(' + "'" + REF_TAB + "'!" + '$D:$D,MATCH($B$2&"|CASH VOL|PrevDay",'
                    + "'" + REF_TAB + "'!" + '$E:$E,0)),"")';
   const s4 = [];
@@ -426,7 +433,15 @@ function setupCalc() {
       fixed('GEX STRIKE', r),
       '=IF(OR($B' + r + '="",N(' + c(9) + ')=0),"",($B' + r + '/' + c(9) + '-1)*100)',
       '=IF(' + c(8) + '="","",IF(' + c(8) + '<GEX_MIN,"GEX SMALL",'
-        + 'IF(AND(' + c(10) + '<>"",ABS(N(' + c(10) + '))<=PIN_BAND),"AT PIN","")))'
+        + 'IF(AND(' + c(10) + '<>"",ABS(N(' + c(10) + '))<=PIN_BAND),"AT PIN","")))',
+      fixed('EXPIRY', r),
+      /* calendar days from the snapshot day; 0 on expiry day */
+      '=IF(OR(' + c(12) + '="",' + dataDay + '=""),"",IFERROR(' + asDate(c(12)) + '-'
+        + asDate(dataDay) + ',""))',
+      /* sessions after today up to and including expiry (weekends excluded,
+         exchange holidays not) */
+      '=IF(' + c(13) + '="","",IFERROR(NETWORKDAYS(' + asDate(dataDay) + ',' + asDate(c(12))
+        + ')-1,""))'
     ]);
   }
   sh.getRange(f, S4, CALC_ROWS, S4N).setFormulas(s4);
@@ -437,6 +452,8 @@ function setupCalc() {
   sh.getRange(f, S4 + 9, CALC_ROWS, 1).setNumberFormat('#,##0.##');
   sh.getRange(f, S4 + 10, CALC_ROWS, 1).setNumberFormat('0.00');
   sh.getRange(f, S4 + 11, CALC_ROWS, 1).setHorizontalAlignment('center').setFontWeight('bold');
+  sh.getRange(f, S4 + 12, CALC_ROWS, 1).setNumberFormat('dd-mmm-yyyy').setHorizontalAlignment('center');
+  sh.getRange(f, S4 + 13, CALC_ROWS, 2).setNumberFormat('0').setHorizontalAlignment('center');
   const tag4 = sh.getRange(C4(11) + f + ':' + C4(11) + last);
   cf.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('AT PIN').setFontColor('#B06000')
     .setRanges([tag4]).build());
@@ -475,7 +492,7 @@ function setCalcSymbols_(sh) {
   const seen = {}, list = [];
   ref.getRange(2, 1, ref.getLastRow() - 1, 1).getValues().forEach(function (r) {
     const s = String(r[0]).trim();
-    if (s && !seen[s]) { seen[s] = 1; list.push(s); }
+    if (s && s !== '_ALL' && !seen[s]) { seen[s] = 1; list.push(s); }
   });
   list.sort();
   sh.getRange('B2').setDataValidation(SpreadsheetApp.newDataValidation()
@@ -784,7 +801,9 @@ function render_(rows, day, tabName) {
       }
       if (c < FIXED) { line.push(raw); col.push('#111111'); continue; }
       if (raw === '') { line.push(''); col.push('#000000'); continue; }
-      const v = parseFloat(raw);
+      /* Number(), not parseFloat(): parseFloat('2026-10-27') is 2026, which
+         would print the EXPIRY row as a number. */
+      const v = Number(raw);
       if (isNaN(v)) { line.push(raw); col.push('#111111'); continue; }
       let prev = NaN;                         /* vs previous non-empty snapshot */
       for (let k = c - 1; k >= FIXED; k--) {
