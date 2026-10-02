@@ -219,9 +219,19 @@ function pullLong_(day, matrixRows) {
     sh.clearContents();
     const rows = [['Symbol', 'Metric', t[0] === LONG_TAB ? 'Time' : 'Field', 'Value', 'Key']]
                    .concat(t[1]);
-    sh.getRange(1, 1, rows.length, 5).setNumberFormats(
-      rows.map(function () { return ['@', '@', '@', 'General', '@']; }));
-    sh.getRange(1, 1, rows.length, 5).setValues(rows);
+    /* Room for every row, then text format by WHOLE COLUMN (one call each):
+       a per-cell format array for ~66,000 rows timed out ("Service
+       Spreadsheets timed out"). Text keeps 09:20 and the keys as typed. */
+    if (sh.getMaxRows() < rows.length) sh.insertRowsAfter(sh.getMaxRows(), rows.length - sh.getMaxRows());
+    sh.getRange('A:C').setNumberFormat('@');
+    sh.getRange('E:E').setNumberFormat('@');
+    /* Written in blocks, each its own call, so no single call is too large. */
+    const BLOCK_ROWS = 10000;
+    for (let i = 0; i < rows.length; i += BLOCK_ROWS) {
+      const part = rows.slice(i, i + BLOCK_ROWS);
+      sh.getRange(i + 1, 1, part.length, 5).setValues(part);
+      SpreadsheetApp.flush();
+    }
     if (!sh.isSheetHidden()) sh.hideSheet();
   });
   console.log(LONG_TAB + ': ' + longRows.length + ' values,  ' + REF_TAB + ': '
