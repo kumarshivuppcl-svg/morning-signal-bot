@@ -546,6 +546,7 @@ def option_data(symbols, anchors=None):
                          "call_prev_oi": c_prev, "put_prev_oi": p_prev,
                          "call_sprd": c_sp, "put_sprd": p_sp,
                          "call_oi_fix": co_f, "put_oi_fix": po_f, "atm_iv": atm_iv,
+                         "spot": spot,
                          "call_oi_fix_prev": co_f0, "put_oi_fix_prev": po_f0,
                          "greeks": _greeks(sel, spot, exps[0], rec.get("timestamp", "")),
                          "expiry": _iso_expiry(exps[0]), "strikes": sel_ks}
@@ -934,6 +935,9 @@ def main():
         # ---- futures+options totals
         f = fut.get(s)
         if f:
+            # oi-spurts truncates to whole rupees (BANKBARODA 230.82 -> 230,
+            # up to 0.36% off); it is only the fallback when the option chain
+            # failed. The chain's underlyingValue below overwrites it.
             if f.get("spot"):
                 put(s, "PRICE", f["spot"])
             if f.get("volume"):
@@ -951,6 +955,9 @@ def main():
         # ---- options, ATM +/-STRIKES of the nearest expiry
         o = opt.get(s)
         if o:
+            # Exact price, with paise, from the option chain fetched this snapshot.
+            if o.get("spot", 0) > 0:
+                put(s, "PRICE", round(o["spot"], 2))
             put(s, "CALL VOL", o["call_vol"])
             put(s, "PUT VOL",  o["put_vol"])
             put(s, "CALL OI",  o["call_oi"])
