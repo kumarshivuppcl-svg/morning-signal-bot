@@ -63,8 +63,15 @@ def _bhav(day):
             "https://nsearchives.nseindia.com/products/content/"
             f"sec_bhavdata_full_{d}{m}{y}.csv", timeout=25)
         if r.status_code == 200 and len(r.content) > 500:
+            want = datetime.strptime(day, "%Y-%m-%d").strftime("%d-%b-%Y").lower()
             for x in csv.DictReader(r.text.splitlines()):
                 k = {kk.strip(): vv.strip() for kk, vv in x.items() if kk}
+                # For a holiday NSE serves the PREVIOUS session's file under the
+                # holiday's name; treat that as "no session" or the holiday
+                # counts as a day with zero return (11-Sep-2026 got r1 = 0).
+                if k.get("DATE1", "").lower() != want:
+                    out = {}
+                    break
                 if k.get("SERIES") == "EQ":
                     try:
                         out[k["SYMBOL"]] = float(k["CLOSE_PRICE"])
