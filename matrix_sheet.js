@@ -61,8 +61,10 @@ const TOP_COLS = [
 /* The 10-minute job. Copies data in; Sheet1's formulas do the rest. */
 function refreshNow() {
   const day = istToday();
-  /* The top-15 ranking is no longer shown in the sheet (user, 7 Oct 2026).
-     GitHub still makes it each day and the scorecard records what followed. */
+  /* Ranking first: it is the tab you read, and it must not be skipped if the
+     much larger matrix render is slow. */
+  pullTop_(day);
+  ensureSheet1_();
   const res = fetchCsv_(day);
   if (res) {
     pullLong_(day, res);           /* raw numbers first: the CALC page reads them */
@@ -88,6 +90,8 @@ function showLastDay() {
     const d = Utilities.formatDate(new Date(t.getTime() - i * 86400000), 'Asia/Kolkata', 'yyyy-MM-dd');
     const res = fetchCsv_(d);
     if (!res) continue;
+    pullTop_(d);
+    ensureSheet1_();
     pullLong_(d, res);
     ensureCalc_();
     render_(res, d, 'MATRIX');
@@ -96,7 +100,7 @@ function showLastDay() {
   }
   console.log('no data in the last 10 days');
 }
-function topOnly()  { console.log('the top-15 view was removed from the sheet (7 Oct 2026)'); }
+function topOnly()  { pullTop_(istToday()); ensureSheet1_(); }
 
 /* Copy today's ranking CSV into TOP15_DATA. On any failure the previous data
    is left in place -- and Sheet1's status line shows how old it is. */
@@ -256,7 +260,7 @@ function setupCalc() {
   sh.clearConditionalFormatRules();
   sh.getRange('A:Z').setFontFamily('Arial').setFontSize(10);
 
-  const mtx = ss.getSheetByName('MATRIX');
+  const top = top1Sheet_(ss);
   const L = "'" + LONG_TAB + "'!", R = "'" + REF_TAB + "'!";
   const yellow = '#FFF2CC', head = '#1F3864';
 
@@ -266,9 +270,9 @@ function setupCalc() {
   sh.getRange('A2').setValue('Stock').setFontWeight('bold');
   sh.getRange('B2').setValue(keep.sym || '').setBackground(yellow).setFontWeight('bold')
     .setBorder(true, true, true, true, false, false);
-  sh.getRange('C2').setValue('click a stock name on MATRIX, or pick from the list')
+  sh.getRange('C2').setValue('click a stock name on TOP 15 or MATRIX, or pick from the list')
     .setFontColor('#5F6368').setFontSize(9);
-  if (mtx) sh.getRange('H2').setFormula('=HYPERLINK("#gid=' + mtx.getSheetId() + '","<- back to MATRIX")');
+  sh.getRange('H2').setFormula('=HYPERLINK("#gid=' + top.getSheetId() + '","<- back to TOP 15")');
 
   /* --- parameters --------------------------------------------------------- */
   sh.getRange('A4').setValue('PARAMETERS  -  edit the yellow cells; every formula below reads them')
@@ -718,24 +722,6 @@ function ensureCalc_() {
 
 
 /* ============================================================== Sheet1 ===== */
-
-/* Run once: removes the top-15 view (the formula sheet and its data tab) from
-   the spreadsheet. Only a sheet whose formulas read TOP15_DATA is deleted.
-   The ranking itself keeps being made on GitHub (top15_<day>.csv) and tracked
-   in data/scorecard.csv; it is just no longer shown here. */
-function removeTop15View() {
-  const ss = book_();
-  ['Sheet1', 'TOP 15'].forEach(function (n) {
-    const sh = ss.getSheetByName(n);
-    if (sh && String(sh.getRange(TOP_FIRST, 3).getFormula()).indexOf(DATA_TAB) >= 0
-        && ss.getSheets().length > 1) {
-      ss.deleteSheet(sh);
-      console.log('removed sheet ' + n);
-    }
-  });
-  const d = ss.getSheetByName(DATA_TAB);
-  if (d && ss.getSheets().length > 1) { ss.deleteSheet(d); console.log('removed ' + DATA_TAB); }
-}
 
 function top1Sheet_(ss) {
   let sh = ss.getSheetByName('Sheet1');
