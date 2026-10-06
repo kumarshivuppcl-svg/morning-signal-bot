@@ -763,8 +763,8 @@ function setupSheet1() {
              + 'MOD(NOW(),1)<=TIME(15,40,0))';
 
   sh.getRange('A1').setFormula(
-    '="TOP 15 OPPORTUNITIES   "&IF(' + day + '="","",TEXT(' + day + ',"dd-mmm-yyyy"))'
-    + '&"      ranked 0.4 volume + 0.3 options + 0.3 OI, vs a 2-session baseline"')
+    '="WATCH LIST  -  15 most active F&O stocks   "&IF(' + day + '="","",TEXT(' + day + ',"dd-mmm-yyyy"))'
+    + '&"      NOT a buy/sell recommendation  -  ranked by activity only (0.4 volume + 0.3 options + 0.3 OI)"')
     .setFontWeight('bold').setFontSize(11);
 
   /* Two clocks. "data" = how old GitHub's snapshot is (the collector).
@@ -782,7 +782,9 @@ function setupSheet1() {
     .setFontSize(10);
 
   sh.getRange('A3').setValue(
-    'Click a stock name to open its step-by-step calculations (CALC tab)   |   '
+    'WATCH ONLY: this ranking has no proven edge (scorecard: it trailed the average F&O stock). '
+    + 'Use it to choose what to watch, not what to trade.   |   '
+    + 'Click a stock name to open its step-by-step calculations (CALC tab)   |   '
     + 'GAP% open vs prev close · OPEN% now vs today\'s open · CHG% now vs prev close'
     + '   |   BUILD = whole day, SESSION = since the open, bold where they disagree'
     + '   |   vs VWAP +above / -below   |   dCPR/wCPR price vs daily/weekly pivot range,'
