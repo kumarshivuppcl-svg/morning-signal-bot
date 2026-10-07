@@ -69,6 +69,8 @@ function refreshNow() {
   if (res) {
     pullLong_(day, res);           /* raw numbers first: the CALC page reads them */
     ensureCalc_();
+    try { ruleTab_(day, res); } catch (e) { console.log('RULE tab failed: ' + e.message); }
+    try { ensureBlocks_(); } catch (e) { console.log('BLOCKS tab failed: ' + e.message); }
     render_(res, day, 'MATRIX');
     return;
   }
@@ -94,6 +96,8 @@ function showLastDay() {
     ensureSheet1_();
     pullLong_(d, res);
     ensureCalc_();
+    try { ruleTab_(d, res); } catch (e) { console.log('RULE tab failed: ' + e.message); }
+    try { ensureBlocks_(); } catch (e) { console.log('BLOCKS tab failed: ' + e.message); }
     render_(res, d, 'MATRIX');
     console.log('showing ' + d);
     return;
@@ -718,6 +722,260 @@ function setCalcSymbols_(sh) {
 function ensureCalc_() {
   const sh = book_().getSheetByName(CALC_TAB);
   if (!sh || sh.getRange(CALC_FIRST, 1).getFormula().indexOf(LONG_TAB) < 0) setupCalc();
+}
+
+
+/* ========================================================= YOUR RULE ===== */
+
+/* The user's own decision rule, every stock, from the 10-minute matrix.
+   Google has no futures-only OI, no single-strike OI and no 1-minute data, so
+   (user's choice, 8 Oct) F&O OI stands in for futures OI, the fixed strike band
+   (CALL / PUT OI FIX) for single strikes, and "price down + cash pace" for
+   "cash selling dominates". BULL / BEAR CASE only when all 4 hold DEC_N bars
+   in a row. Recomputed by refreshNow; settings are the yellow cells. */
+const RULE_TAB = 'RULE';
+const RULE_FIRST = 6;
+const RULE_NAMES = ['Bull1 F&O OI down+price up', 'Bull2 above pivot top', 'Bull3 call OI (band) down+price up',
+                    'Bull4 put OI (band) up', 'Bear1 F&O OI up+price down', 'Bear2 below prev low',
+                    'Bear3 call OI (band) up', 'Bear4 price down+cash pace'];
+
+function ruleTab_(day, rows) {
+  const ss = book_();
+  let sh = ss.getSheetByName(RULE_TAB);
+  const fresh = !sh;
+  if (fresh) sh = ss.insertSheet(RULE_TAB);
+  /* settings: keep what the user typed */
+  let decN = Number(sh.getRange('B2').getValue()), pace = sh.getRange('B3').getValue();
+  if (!(decN >= 1)) decN = 3;
+  pace = (pace === '' || isNaN(Number(pace))) ? 1.5 : Number(pace);
+
+  /* previous session's low per stock (collector's daily.csv) */
+  const low = {};
+  const dr = UrlFetchApp.fetch(RAW + 'daily.csv?cb=' + Date.now(), { muteHttpExceptions: true });
+  if (dr.getResponseCode() === 200) {
+    const dv = Utilities.parseCsv(dr.getContentText());
+    const h = dv[0].map(function (x) { return String(x).trim(); });
+    const iS = h.indexOf('Symbol'), iD = h.indexOf('Date'), iL = h.indexOf('Low');
+    dv.slice(1).forEach(function (x) {
+      const s = String(x[iS] || '').trim(), d = String(x[iD] || '').trim(), v = Number(x[iL]);
+      if (s && d < day && !isNaN(v) && (!low[s] || d > low[s].d)) low[s] = { d: d, v: v };
+    });
+  }
+
+  const head = rows[0].map(function (x) { return String(x).trim(); });
+  const T = [], col = {};
+  head.forEach(function (x, i) { col[x] = i; if (x.indexOf(':') > 0) T.push(i); });
+  const num = function (r, i) {
+    if (!r) return NaN;
+    const s = String(r[i] === undefined ? '' : r[i]).trim();
+    return s === '' ? NaN : Number(s);
+  };
+  const by = {};
+  rows.slice(1).forEach(function (r) {
+    const s = String(r[0] || '').trim(), m = String(r[1] || '').trim();
+    if (s) (by[s] = by[s] || {})[m] = r;
+  });
+
+  const out = [];
+  let lastT = '';
+  Object.keys(by).sort().forEach(function (s) {
+    const M = by[s], P = M['PRICE'];
+    const idx = T.filter(function (i) { return !isNaN(num(P, i)); });   /* snapshots with a price */
+    if (idx.length < 2) return;
+    const top = Math.max(num(P, col['dTC']), num(P, col['dBC']));
+    const pl = low[s] ? low[s].v : NaN;
+    const cash10 = [];
+    const bars = [];
+    for (let k = 1; k < idx.length; k++) {
+      const j = idx[k], p = idx[k - 1];
+      const d = function (m) { return num(M[m], j) - num(M[m], p); };
+      const dP = d('PRICE'), dFO = d('F&O OI'), dC = d('CALL OI FIX'), dPt = d('PUT OI FIX');
+      const c10 = d('CASH VOL');
+      const earlier = cash10.filter(function (x) { return !isNaN(x); });
+      const avg = earlier.length ? earlier.reduce(function (a, b) { return a + b; }, 0) / earlier.length : NaN;
+      const pc = (avg > 0 && !isNaN(c10)) ? c10 / avg : NaN;
+      cash10.push(c10);
+      const px = num(P, j);
+      const c = [dFO < 0 && dP > 0, px > top, dC < 0 && dP > 0, dPt > 0,
+                 dFO > 0 && dP < 0, px < pl, dC > 0,
+                 dP < 0 && (pace > 0 ? pc >= pace : c10 > 0)];
+      bars.push({ t: head[j], px: px, c: c, bull: c[0] && c[1] && c[2] && c[3], bear: c[4] && c[5] && c[6] && c[7] });
+    }
+    const b = bars[bars.length - 1];
+    const lastN = bars.slice(-decN);
+    let dec = 'NONE';
+    if (lastN.length >= decN && lastN.every(function (x) { return x.bull; })) dec = 'BULL CASE';
+    else if (lastN.length >= decN && lastN.every(function (x) { return x.bear; })) dec = 'BEAR CASE';
+    const yes = function (v) { return v ? 'YES' : ''; };
+    const met = RULE_NAMES.filter(function (n, i) { return b.c[i]; }).join(' | ');
+    out.push([s, b.t, b.px].concat(b.c.slice(0, 4).map(yes), [b.bull ? 'BULL' : ''],
+                                     b.c.slice(4).map(yes), [b.bear ? 'BEAR' : '', dec, met]));
+    if (b.t > lastT) lastT = b.t;
+  });
+
+  const H = ['Stock', 'Time', 'Price', 'Bull 1: F&O OI falls + price up', 'Bull 2: Price above daily pivot range top',
+             'Bull 3: Call OI (fixed band) falls + price up', 'Bull 4: Put OI (fixed band) rises', 'BULL - this bar (all 4)',
+             'Bear 1: F&O OI rises + price down', 'Bear 2: Price below previous day low',
+             'Bear 3: Call OI (fixed band) rises', 'Bear 4: Price down + cash pace >= CASH_PACE', 'BEAR - this bar (all 4)',
+             'DECISION (all 4 for DEC_N bars)', 'Conditions met this bar'];
+  sh.getRange('A1').setValue('YOUR DECISION RULE  -  all F&O stocks  -  ' + day + '  ' + lastT
+                             + '   (filter or sort the columns as you like)').setFontWeight('bold').setFontSize(12);
+  sh.getRange('A2:C4').setValues([
+    ['DEC_N', decN, 'BULL / BEAR CASE when all 4 conditions hold this many 10-minute bars in a row'],
+    ['CASH_PACE', pace, 'Bear 4: this 10-min cash volume / average of today\'s earlier 10-min volumes (0 = any volume)'],
+    ['', '', 'Google data: F&O OI (futures + options) in place of futures OI; fixed strike band (11 strikes around '
+             + 'previous close) in place of single strikes; changes are vs the previous 10-minute snapshot. '
+             + 'Settings apply at the next refresh.']]);
+  sh.getRange('B2:B3').setBackground('#FFF2CC').setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('C2:C4').setFontColor('#5F6368').setFontSize(9);
+  sh.getRange(RULE_FIRST - 1, 1, 1, H.length).setValues([H]).setFontWeight('bold').setBackground('#7F6000')
+    .setFontColor('#FFFFFF').setWrap(true).setVerticalAlignment('middle').setHorizontalAlignment('center');
+  const last = Math.max(sh.getLastRow(), RULE_FIRST);
+  sh.getRange(RULE_FIRST, 1, last - RULE_FIRST + 1, H.length).clearContent();
+  if (out.length) {
+    sh.getRange(RULE_FIRST, 1, out.length, H.length).setValues(out);
+    sh.getRange(RULE_FIRST, 2, out.length, 1).setNumberFormat('@');
+    sh.getRange(RULE_FIRST, 3, out.length, 1).setNumberFormat('#,##0.00');
+  }
+  if (fresh || sh.getConditionalFormatRules().length === 0) {
+    const all = sh.getRange(RULE_FIRST, 4, 400, H.length - 3);
+    const rule = function (txt, bg, font) {
+      return SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(txt).setBackground(bg)
+        .setFontColor(font).setBold(true).setRanges([all]).build();
+    };
+    sh.setConditionalFormatRules([rule('BULL CASE', '#B7E1CD', '#137333'), rule('BEAR CASE', '#F4C7C3', '#B3261E'),
+                                  rule('BULL', '#FFFFFF', '#137333'), rule('BEAR', '#FFFFFF', '#B3261E'),
+                                  rule('YES', '#CEEFD9', '#000000')]);
+    sh.setFrozenRows(RULE_FIRST - 1);
+    sh.setFrozenColumns(1);
+    sh.setRowHeight(RULE_FIRST - 1, 60);
+    sh.setColumnWidth(1, 110);
+    for (let c = 4; c <= 14; c++) sh.setColumnWidth(c, 86);
+    sh.setColumnWidth(15, 420);
+    sh.getRange(RULE_FIRST - 1, 1, 400, H.length).setFontFamily('Arial').setFontSize(9);
+  }
+  console.log('RULE: ' + out.length + ' stocks at ' + lastT + ' (DEC_N ' + decN + ', CASH_PACE ' + pace + ')');
+}
+
+
+/* ============================================================ BLOCKS ===== */
+
+/* Blocks of N minutes (B3, multiple of 10) for one stock (B2; follows CALC's
+   stock unless you type one). All formulas over DATA_LONG / DATA_REF. The first
+   block starts from the previous day's close and OI. */
+const BLOCKS_TAB = 'BLOCKS';
+const BLK_FIRST = 7, BLK_ROWS = 40;
+
+function setupBlocks() {
+  const ss = book_();
+  let sh = ss.getSheetByName(BLOCKS_TAB);
+  let keepSym = '', keepSize = 30;
+  if (sh) {
+    keepSym = sh.getRange('B2').getFormula() || sh.getRange('B2').getValue();
+    const z = Number(sh.getRange('B3').getValue());
+    if (z >= 10) keepSize = z;
+  } else {
+    sh = ss.insertSheet(BLOCKS_TAB);
+  }
+  sh.clear();
+  sh.clearConditionalFormatRules();
+  sh.getRange('A:P').setFontFamily('Arial').setFontSize(10);
+  const L = "'" + LONG_TAB + "'!", R = "'" + REF_TAB + "'!";
+  const v = function (metric, tcell) {
+    return 'IFERROR(INDEX(' + L + '$D:$D,MATCH($B$2&"|' + metric + '|"&' + tcell + ',' + L + '$E:$E,0)),"")';
+  };
+  const ref = function (metric) {
+    return 'IFERROR(INDEX(' + R + '$D:$D,MATCH($B$2&"|' + metric + '|PrevDay",' + R + '$E:$E,0)),"")';
+  };
+  sh.getRange('A1').setFormula('="BLOCKS  -  "&$B$2&"  -  "&$B$3&"-minute blocks"').setFontWeight('bold').setFontSize(13);
+  sh.getRange('A2').setValue('Stock');
+  if (keepSym && String(keepSym).charAt(0) !== '=') sh.getRange('B2').setValue(keepSym);   /* a typed symbol stays */
+  else sh.getRange('B2').setFormula("='" + CALC_TAB + "'!B2");
+  sh.getRange('C2').setValue('follows the CALC stock; type a symbol here to pick another (delete it to follow CALC again: ='
+                             + CALC_TAB + '!B2)');
+  sh.getRange('A3').setValue('Block size (minutes)');
+  sh.getRange('B3').setValue(keepSize);
+  sh.getRange('C3').setValue('10, 20, 30, 60 ... (snapshots are every 10 minutes)');
+  sh.getRange('B2:B3').setBackground('#FFF2CC').setFontWeight('bold');
+  sh.getRange('C2:C3').setFontColor('#5F6368').setFontSize(9);
+  sh.getRange('A4').setValue('Cash volume in shares; OI in contracts. F&O OI = futures + options. Call / Put OI = fixed band '
+                             + 'of strikes around the previous close. A block is blank if its snapshot is missing.')
+    .setFontColor('#5F6368').setFontSize(9);
+  const H = ['From', 'To', 'Start price', 'End price', 'Price move %', 'Cash volume in block', 'Cash volume (day so far)',
+             'F&O OI (end)', 'F&O OI change', 'F&O participants', 'Call OI band (end)', 'Call OI change',
+             'Put OI band (end)', 'Put OI change', 'end minute'];
+  sh.getRange(5, 1, 1, H.length).setValues([H]).setFontWeight('bold').setBackground('#1F3864')
+    .setFontColor('#FFFFFF').setWrap(true).setHorizontalAlignment('center').setVerticalAlignment('middle');
+  const f = [];
+  const label = function (r) {
+    return '=IF(OR($E' + r + '="",$I' + r + '=""),"",IF(AND($E' + r + '>0,$I' + r + '>0),"FRESH LONGS",IF(AND($E' + r
+           + '>0,$I' + r + '<0),"SHORT COVERING",IF(AND($E' + r + '<0,$I' + r + '>0),"FRESH SHORTS",IF(AND($E' + r
+           + '<0,$I' + r + '<0),"LONG UNWINDING","-")))))';
+  };
+  for (let n = 0; n < BLK_ROWS; n++) {
+    const r = BLK_FIRST + n, p = r - 1, first = n === 0;
+    const has = '$D' + r + '=""';
+    const m = first ? '=CEILING(560,$B$3)' : '=IF($O' + p + '="","",IF($O' + p + '+$B$3>930,"",$O' + p + '+$B$3))';
+    f.push([
+      first ? '="09:15"' : '=IF($B' + r + '="","",$B' + p + ')',
+      '=IF($O' + r + '="","",TEXT(INT($O' + r + '/60),"00")&":"&TEXT(MOD($O' + r + ',60),"00"))',
+      '=IF(' + has + ',"",' + (first ? ref('PRICE') : '$D' + p) + ')',
+      '=IF($B' + r + '="","",' + v('PRICE', '$B' + r) + ')',
+      '=IF(OR($C' + r + '="",$D' + r + '=""),"",($D' + r + '/$C' + r + '-1)*100)',
+      '=IF(OR(' + has + ',$G' + r + '=""),"",' + (first ? '$G' + r : 'IF($G' + p + '="","",$G' + r + '-$G' + p + ')') + ')',
+      '=IF(' + has + ',"",' + v('CASH VOL', '$B' + r) + ')',
+      '=IF(' + has + ',"",' + v('F&O OI', '$B' + r) + ')',
+      '=IF(OR(' + has + ',$H' + r + '=""),"",' + (first ? 'IF(' + ref('F&O OI') + '="","",$H' + r + '-' + ref('F&O OI') + ')'
+                                                         : 'IF($H' + p + '="","",$H' + r + '-$H' + p + ')') + ')',
+      label(r),
+      '=IF(' + has + ',"",' + v('CALL OI FIX', '$B' + r) + ')',
+      '=IF(OR(' + has + ',$K' + r + '=""),"",' + (first ? 'IF(' + ref('CALL OI FIX') + '="","",$K' + r + '-' + ref('CALL OI FIX') + ')'
+                                                         : 'IF($K' + p + '="","",$K' + r + '-$K' + p + ')') + ')',
+      '=IF(' + has + ',"",' + v('PUT OI FIX', '$B' + r) + ')',
+      '=IF(OR(' + has + ',$M' + r + '=""),"",' + (first ? 'IF(' + ref('PUT OI FIX') + '="","",$M' + r + '-' + ref('PUT OI FIX') + ')'
+                                                         : 'IF($M' + p + '="","",$M' + r + '-$M' + p + ')') + ')',
+      m
+    ]);
+  }
+  sh.getRange(BLK_FIRST, 1, BLK_ROWS, H.length).setFormulas(f);
+  /* whole day so far */
+  const lastOf = function (c) {
+    const rg = '$' + c + '$' + BLK_FIRST + ':$' + c + '$' + (BLK_FIRST + BLK_ROWS - 1);
+    return 'IFERROR(INDEX(FILTER(' + rg + ',' + rg + '<>""),ROWS(FILTER(' + rg + ',' + rg + '<>""))),"")';
+  };
+  const sumOf = function (c) { return '=SUM(' + c + BLK_FIRST + ':' + c + (BLK_FIRST + BLK_ROWS - 1) + ')'; };
+  sh.getRange(6, 1, 1, 14).setFormulas([[
+    '="WHOLE DAY"', '=' + lastOf('B'), '=' + ref('PRICE'), '=' + lastOf('D'),
+    '=IF(OR($C6="",$D6=""),"",($D6/$C6-1)*100)', sumOf('F'), '=' + lastOf('G'), '=' + lastOf('H'), sumOf('I'),
+    '', '=' + lastOf('K'), sumOf('L'), '=' + lastOf('M'), sumOf('N')]]);
+  sh.getRange(6, 1, 1, 14).setFontWeight('bold').setBackground('#F1F3F4');
+  const all = function (c) { return sh.getRange(6, c, BLK_ROWS + 1, 1); };
+  all(2).setNumberFormat('@');
+  [3, 4].forEach(function (c) { all(c).setNumberFormat('#,##0.00'); });
+  all(5).setNumberFormat('0.00;-0.00');
+  [6, 7, 8, 11, 13].forEach(function (c) { all(c).setNumberFormat('#,##0'); });
+  [9, 12, 14].forEach(function (c) { all(c).setNumberFormat('#,##0;-#,##0'); });
+  const rules = [];
+  const add = function (rng, f_, color) {
+    rules.push(SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(f_).setFontColor(color).setBold(true)
+      .setRanges([rng]).build());
+  };
+  add(all(5), '=AND(ISNUMBER($E6),$E6>0)', '#137333');
+  add(all(5), '=AND(ISNUMBER($E6),$E6<0)', '#B3261E');
+  add(all(10), '=OR($J6="FRESH LONGS",$J6="SHORT COVERING")', '#137333');
+  add(all(10), '=OR($J6="FRESH SHORTS",$J6="LONG UNWINDING")', '#B3261E');
+  sh.setConditionalFormatRules(rules);
+  sh.hideColumns(15);
+  sh.setFrozenRows(6);
+  sh.setRowHeight(5, 45);
+  for (let c = 1; c <= 14; c++) sh.setColumnWidth(c, c === 10 ? 120 : 92);
+  setCalcSymbols_(sh);
+  console.log('BLOCKS built: ' + BLK_ROWS + ' block rows');
+}
+
+function ensureBlocks_() {
+  const sh = book_().getSheetByName(BLOCKS_TAB);
+  if (!sh || sh.getRange(BLK_FIRST, 4).getFormula().indexOf(LONG_TAB) < 0) setupBlocks();
 }
 
 
