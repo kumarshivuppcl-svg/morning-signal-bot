@@ -912,28 +912,38 @@ function setupBlocks() {
            + '>0,$I' + r + '<0),"SHORT COVERING",IF(AND($E' + r + '<0,$I' + r + '>0),"FRESH SHORTS",IF(AND($E' + r
            + '<0,$I' + r + '<0),"LONG UNWINDING","-")))))';
   };
+  /* A block starts where the last block WITH data ended; if no earlier block
+     has data (collector started late, or a missed snapshot), it starts from the
+     previous day's close / OI. So a gap widens the next block instead of
+     blanking the rest of the day. */
+  const before = function (c, p, fallback) {
+    if (p < BLK_FIRST) return fallback;
+    const rg = '$' + c + '$' + BLK_FIRST + ':$' + c + '$' + p, k = '$D$' + BLK_FIRST + ':$D$' + p;
+    return 'IFERROR(INDEX(FILTER(' + rg + ',' + k + '<>""),ROWS(FILTER(' + rg + ',' + k + '<>""))),' + fallback + ')';
+  };
+  const chg = function (c, r, p, metric) {
+    const base = before(c, p, metric ? ref(metric) : '0');
+    return '=IF(OR($D' + r + '="",$' + c + r + '=""),"",IF(' + base + '="","",$' + c + r + '-' + base + '))';
+  };
   for (let n = 0; n < BLK_ROWS; n++) {
     const r = BLK_FIRST + n, p = r - 1, first = n === 0;
     const has = '$D' + r + '=""';
     const m = first ? '=CEILING(560,$B$3)' : '=IF($O' + p + '="","",IF($O' + p + '+$B$3>930,"",$O' + p + '+$B$3))';
     f.push([
-      first ? '="09:15"' : '=IF($B' + r + '="","",$B' + p + ')',
+      '=IF(' + has + ',"",' + before('B', p, '"09:15"') + ')',
       '=IF($O' + r + '="","",TEXT(INT($O' + r + '/60),"00")&":"&TEXT(MOD($O' + r + ',60),"00"))',
-      '=IF(' + has + ',"",' + (first ? ref('PRICE') : '$D' + p) + ')',
+      '=IF(' + has + ',"",' + before('D', p, ref('PRICE')) + ')',
       '=IF($B' + r + '="","",' + v('PRICE', '$B' + r) + ')',
       '=IF(OR($C' + r + '="",$D' + r + '=""),"",($D' + r + '/$C' + r + '-1)*100)',
-      '=IF(OR(' + has + ',$G' + r + '=""),"",' + (first ? '$G' + r : 'IF($G' + p + '="","",$G' + r + '-$G' + p + ')') + ')',
+      chg('G', r, p, null),
       '=IF(' + has + ',"",' + v('CASH VOL', '$B' + r) + ')',
       '=IF(' + has + ',"",' + v('F&O OI', '$B' + r) + ')',
-      '=IF(OR(' + has + ',$H' + r + '=""),"",' + (first ? 'IF(' + ref('F&O OI') + '="","",$H' + r + '-' + ref('F&O OI') + ')'
-                                                         : 'IF($H' + p + '="","",$H' + r + '-$H' + p + ')') + ')',
+      chg('H', r, p, 'F&O OI'),
       label(r),
       '=IF(' + has + ',"",' + v('CALL OI FIX', '$B' + r) + ')',
-      '=IF(OR(' + has + ',$K' + r + '=""),"",' + (first ? 'IF(' + ref('CALL OI FIX') + '="","",$K' + r + '-' + ref('CALL OI FIX') + ')'
-                                                         : 'IF($K' + p + '="","",$K' + r + '-$K' + p + ')') + ')',
+      chg('K', r, p, 'CALL OI FIX'),
       '=IF(' + has + ',"",' + v('PUT OI FIX', '$B' + r) + ')',
-      '=IF(OR(' + has + ',$M' + r + '=""),"",' + (first ? 'IF(' + ref('PUT OI FIX') + '="","",$M' + r + '-' + ref('PUT OI FIX') + ')'
-                                                         : 'IF($M' + p + '="","",$M' + r + '-$M' + p + ')') + ')',
+      chg('M', r, p, 'PUT OI FIX'),
       m
     ]);
   }
